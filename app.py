@@ -540,7 +540,7 @@ def apply_templates(grid: list[list[str]], warped: Image.Image) -> list[list[str
             if crop.size == 0 or float(crop.max()) < 105:
                 continue
             classified = classify_from_templates(cell_feature(warped, row, col), templates)
-            if classified:
+            if classified and not updated[row][col]:
                 updated[row][col] = classified[0]
     return updated
 
@@ -592,7 +592,6 @@ def analyze(payload: dict[str, Any]) -> dict[str, Any]:
     if grid_character_count(grid) < 8:
         for box in boxes:
             place_char(grid, box, screen_size)
-    grid = apply_templates(grid, warped)
     corrected_grid = apply_corrections(grid)
 
     preview_id = f"{uuid.uuid4().hex}.png"
@@ -651,9 +650,11 @@ def export_docx(payload: dict[str, Any]) -> dict[str, str]:
 
 
 def remember(payload: dict[str, Any]) -> dict[str, Any]:
-    original = str(payload.get("original", "")).strip()
-    corrected = str(payload.get("corrected", "")).strip()
-    if not original or not corrected:
+    original_raw = str(payload.get("original", ""))
+    corrected_raw = str(payload.get("corrected", ""))
+    original = re.sub(r"\s+", " ", original_raw).strip()
+    corrected = corrected_raw[:COLS].ljust(COLS)
+    if not original or not corrected.strip():
         raise ValueError("Both original and corrected text are required.")
 
     corrections = load_corrections()

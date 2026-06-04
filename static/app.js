@@ -397,7 +397,7 @@ function getCurrentGrid() {
 }
 
 function gridRowText(row) {
-  return row.map((cell) => cell || " ").join("").replace(/\s+/g, " ").trim();
+  return row.map((cell) => (cell || " ").slice(0, 1)).join("").slice(0, COLS).padEnd(COLS, " ");
 }
 
 async function postJson(url, body) {
