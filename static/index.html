@@ -1,0 +1,75 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>777-9 MCMDU Grid Tool</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <header class="topbar">
+      <div>
+        <h1>777-9 MCMDU Grid Tool</h1>
+        <p>Align the screen, tune the 13 x 40 grid, OCR the cells, then export a Word reference table.</p>
+      </div>
+      <div class="status" id="status">Ready</div>
+    </header>
+
+    <main class="workspace">
+      <section class="panel capture-panel">
+        <div class="panel-head">
+          <h2>Image and Grid</h2>
+          <label class="upload-button">
+            <input id="fileInput" type="file" accept="image/*" />
+            Choose Image
+          </label>
+        </div>
+
+        <div class="canvas-shell">
+          <canvas id="imageCanvas" width="1200" height="780"></canvas>
+          <div class="empty-state" id="emptyState">Load a phone photo of the MCMDU screen to begin.</div>
+        </div>
+
+        <div class="controls">
+          <label>
+            Left inset
+            <input id="leftInset" type="range" min="0" max="18" step="0.25" value="0" />
+          </label>
+          <label>
+            Right inset
+            <input id="rightInset" type="range" min="0" max="18" step="0.25" value="0" />
+          </label>
+          <label>
+            Top inset
+            <input id="topInset" type="range" min="0" max="18" step="0.25" value="0" />
+          </label>
+          <label>
+            Bottom inset
+            <input id="bottomInset" type="range" min="0" max="18" step="0.25" value="0" />
+          </label>
+        </div>
+
+        <div class="actions">
+          <button id="resetCorners" type="button">Reset Corners</button>
+          <button id="detectButton" type="button" disabled>Auto Detect Display</button>
+          <button id="photoViewButton" type="button" disabled>Photo View</button>
+          <button id="flatViewButton" type="button" disabled>Flattened View</button>
+          <button id="analyzeButton" class="primary" type="button" disabled>Analyze Grid</button>
+          <button id="exportButton" type="button" disabled>Export Word File</button>
+        </div>
+      </section>
+
+      <section class="panel results-panel">
+        <div class="panel-head">
+          <h2>Extracted Grid</h2>
+          <button id="rememberButton" type="button" disabled>Remember Corrections</button>
+        </div>
+        <div class="table-wrap">
+          <table id="gridTable" aria-label="MCMDU extracted 13 by 40 grid"></table>
+        </div>
+      </section>
+    </main>
+
+    <script src="/app.js"></script>
+  </body>
+</html>

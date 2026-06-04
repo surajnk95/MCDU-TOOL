@@ -1,0 +1,4 @@
+__pycache__/
+*.pyc
+data/exports/*
+!data/exports/.gitkeep
