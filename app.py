@@ -471,7 +471,12 @@ def place_char(grid: list[list[str]], char_box: dict[str, Any], screen_size: tup
     return False
 
 
-def place_word(grid: list[list[str]], word: dict[str, Any], screen_size: tuple[int, int]) -> None:
+def place_word(
+    grid: list[list[str]],
+    scores: list[list[float]],
+    word: dict[str, Any],
+    screen_size: tuple[int, int],
+) -> None:
     text = clean_ocr_text(str(word["text"]))
     if not text:
         return
@@ -486,11 +491,20 @@ def place_word(grid: list[list[str]], word: dict[str, Any], screen_size: tuple[i
     if not compact:
         return
 
+    quality = word_quality(word)
+    box_cols = max(1, int(round(float(word.get("width") or 1) / cell_w)))
+    use_projected_spacing = box_cols > len(compact) + 1
     max_len = LAST_DATA_COL - start_col + 1
+
     for index, char in enumerate(compact[:max_len]):
-        col = start_col + index
-        if not grid[row][col]:
+        if use_projected_spacing:
+            center_x = float(word["left"]) + float(word["width"]) * ((index + 0.5) / len(compact))
+            col = clamp_data_col(int(center_x / cell_w))
+        else:
+            col = start_col + index
+        if not grid[row][col] or quality > scores[row][col] + 10:
             grid[row][col] = char
+            scores[row][col] = quality
 
 
 def connected_components(mask: np.ndarray) -> list[dict[str, Any]]:
@@ -533,9 +547,44 @@ def connected_components(mask: np.ndarray) -> list[dict[str, Any]]:
                     "x2": x2,
                     "y2": y2,
                     "fill": count / max(1, (x2 - x1) * (y2 - y1)),
+                    "xs": xs,
+                    "ys": ys,
                 }
             )
     return components
+
+
+def component_corners(component: dict[str, Any], scale: float) -> list[dict[str, float]]:
+    x1 = float(component["x1"])
+    y1 = float(component["y1"])
+    x2 = float(component["x2"])
+    y2 = float(component["y2"])
+    fallback = [(x1, y1), (x2, y1), (x2, y2), (x1, y2)]
+    xs = np.asarray(component.get("xs") or [], dtype=np.float32)
+    ys = np.asarray(component.get("ys") or [], dtype=np.float32)
+    if xs.size < 4 or ys.size < 4:
+        points = fallback
+    else:
+        sums = xs + ys
+        diffs = xs - ys
+        points = [
+            (float(xs[int(np.argmin(sums))]), float(ys[int(np.argmin(sums))])),
+            (float(xs[int(np.argmax(diffs))]), float(ys[int(np.argmax(diffs))])),
+            (float(xs[int(np.argmax(sums))]), float(ys[int(np.argmax(sums))])),
+            (float(xs[int(np.argmin(diffs))]), float(ys[int(np.argmin(diffs))])),
+        ]
+        width = max(1.0, x2 - x1)
+        height = max(1.0, y2 - y1)
+        expected = fallback
+        max_corner_error = max(
+            max(abs(px - ex) / width, abs(py - ey) / height)
+            for (px, py), (ex, ey) in zip(points, expected)
+        )
+        if max_corner_error > 0.10:
+            points = fallback
+
+    inv = 1 / scale
+    return [{"x": x * inv, "y": y * inv} for x, y in points]
 
 
 def detect_display(payload: dict[str, Any]) -> dict[str, Any]:
@@ -579,13 +628,10 @@ def detect_display(payload: dict[str, Any]) -> dict[str, Any]:
     y1 = max(0, best["y1"] + pad_y)
     x2 = min(small.width, best["x2"] - pad_x)
     y2 = min(small.height, best["y2"] - pad_y)
+    corner_component = dict(best)
+    corner_component.update({"x1": x1, "y1": y1, "x2": x2, "y2": y2})
+    corners = component_corners(corner_component, scale)
     inv = 1 / scale
-    corners = [
-        {"x": x1 * inv, "y": y1 * inv},
-        {"x": x2 * inv, "y": y1 * inv},
-        {"x": x2 * inv, "y": y2 * inv},
-        {"x": x1 * inv, "y": y2 * inv},
-    ]
     return {
         "corners": corners,
         "confidence": round(float(best["fill"]), 3),
@@ -716,6 +762,59 @@ def verify_grid_with_char_boxes(
     return normalize_grid_guards(verified)
 
 
+def recover_dash_lines(grid: list[list[str]], warped: Image.Image) -> list[list[str]]:
+    updated = [[cell for cell in row] for row in grid]
+    gray = np.asarray(ImageOps.grayscale(warped)).astype(np.float32)
+    screen_w, screen_h = warped.size
+    cell_w = screen_w / COLS
+    cell_h = screen_h / ROWS
+
+    for row in range(ROWS):
+        y1 = int((row + 0.38) * cell_h)
+        y2 = int((row + 0.68) * cell_h)
+        if y2 <= y1:
+            continue
+        strip = gray[max(0, y1) : min(screen_h, y2), :]
+        if strip.size == 0:
+            continue
+
+        active_cols: list[int] = []
+        for col in range(FIRST_DATA_COL, LAST_DATA_COL + 1):
+            x1 = int(col * cell_w + cell_w * 0.10)
+            x2 = int((col + 1) * cell_w - cell_w * 0.10)
+            cell = strip[:, max(0, x1) : min(screen_w, x2)]
+            if cell.size == 0:
+                continue
+            bright = cell > 178
+            bright_ratio = float(np.mean(bright))
+            row_stroke = float(np.max(np.mean(bright, axis=1)))
+            if 0.006 <= bright_ratio <= 0.16 and row_stroke >= 0.34:
+                active_cols.append(col)
+
+        run_start: int | None = None
+        runs: list[tuple[int, int]] = []
+        previous = -99
+        for col in active_cols:
+            if run_start is None or col != previous + 1:
+                if run_start is not None and previous - run_start + 1 >= 9:
+                    runs.append((run_start, previous))
+                run_start = col
+            previous = col
+        if run_start is not None and previous - run_start + 1 >= 9:
+            runs.append((run_start, previous))
+
+        for start, end in runs:
+            # Avoid turning a text-heavy row into dashes. Separator rows normally have
+            # long mostly empty spans with only a few labels at the edges.
+            occupied = sum(1 for col in range(start, end + 1) if updated[row][col])
+            if occupied > max(3, (end - start + 1) // 4):
+                continue
+            for col in range(start, end + 1):
+                if not updated[row][col]:
+                    updated[row][col] = "-"
+    return normalize_grid_guards(updated)
+
+
 def remember_templates(payload: dict[str, Any]) -> dict[str, Any]:
     image = load_image(str(payload["image"]))
     corners = payload.get("corners")
@@ -756,11 +855,13 @@ def analyze(payload: dict[str, Any]) -> dict[str, Any]:
     words = run_tesseract_tsv(processed)
 
     grid = empty_grid()
+    word_scores = [[0.0 for _ in range(COLS)] for _ in range(ROWS)]
     for word in words:
-        place_word(grid, word, screen_size)
+        place_word(grid, word_scores, word, screen_size)
     if grid_character_count(grid) < 8:
         for box in boxes:
             place_char(grid, box, screen_size)
+    grid = recover_dash_lines(grid, warped)
     corrected_grid = normalize_grid_guards(apply_corrections(grid))
 
     preview_id = f"{uuid.uuid4().hex}.png"
