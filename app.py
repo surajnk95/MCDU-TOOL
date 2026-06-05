@@ -453,7 +453,7 @@ def detect_display(payload: dict[str, Any]) -> dict[str, Any]:
     mask = gray < 58
     components = connected_components(mask)
     if not components:
-        raise ValueError("Could not find a dark MCMDU display region.")
+        raise ValueError("Could not find a dark MCDU display region.")
 
     scored: list[tuple[float, dict[str, Any]]] = []
     image_area = small.width * small.height
@@ -647,7 +647,7 @@ def export_docx(payload: dict[str, Any]) -> dict[str, str]:
         raise ValueError("A 13-row grid is required.")
 
     document = Document()
-    document.add_heading("777-9 MCMDU Grid Extraction", level=1)
+    document.add_heading("777-9 MCDU Grid Extraction", level=1)
     document.add_paragraph("Rows are numbered 1 to 13. Screen columns 2 to 39 are labelled 1 to 38.")
 
     table = document.add_table(rows=ROWS + 1, cols=COLS + 1)
@@ -727,7 +727,7 @@ def main() -> None:
     ensure_dirs()
     port = int(os.environ.get("PORT", "8766"))
     server = ThreadingHTTPServer(("127.0.0.1", port), McmduHandler)
-    print(f"777-9 MCMDU Grid Tool running at http://127.0.0.1:{port}")
+    print(f"777-9 MCDU Grid Tool running at http://127.0.0.1:{port}")
     server.serve_forever()
 
 

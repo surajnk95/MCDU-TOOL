@@ -350,7 +350,7 @@ def detect_display(image: Image.Image) -> list[dict[str, float]]:
     gray = arr[:, :, 0] * 0.299 + arr[:, :, 1] * 0.587 + arr[:, :, 2] * 0.114
     components = connected_components(gray < 58)
     if not components:
-        raise ValueError("Could not find a dark MCMDU display region.")
+        raise ValueError("Could not find a dark MCDU display region.")
 
     scored: list[tuple[float, dict[str, Any]]] = []
     image_area = small.width * small.height
@@ -584,7 +584,7 @@ def add_table_header(table: Any) -> None:
 
 def export_docx(grid: list[list[str]], output_path: Path) -> None:
     document = Document()
-    document.add_heading("777-9 MCMDU Grid Extraction", level=1)
+    document.add_heading("777-9 MCDU Grid Extraction", level=1)
     document.add_paragraph("Rows are numbered 1 to 13. Screen columns 2 to 39 are labelled 1 to 38.")
     table = document.add_table(rows=ROWS + 1, cols=COLS + 1)
     table.style = "Table Grid"
@@ -607,7 +607,7 @@ def export_docx(grid: list[list[str]], output_path: Path) -> None:
 class McmduDesktopTool:
     def __init__(self, root: Tk) -> None:
         self.root = root
-        self.root.title("777-9 MCMDU Grid Tool - Single Python")
+        self.root.title("777-9 MCDU Grid Tool - Single Python")
         self.image: Image.Image | None = None
         self.warped: Image.Image | None = None
         self.view_image: Image.Image | None = None
@@ -729,7 +729,7 @@ class McmduDesktopTool:
 
     def choose_image(self) -> None:
         filename = filedialog.askopenfilename(
-            title="Choose MCMDU Image",
+            title="Choose MCDU Image",
             filetypes=[("Images", "*.jpg *.jpeg *.png *.bmp *.tif *.tiff"), ("All files", "*.*")],
         )
         if not filename:
@@ -812,7 +812,7 @@ class McmduDesktopTool:
         if self.display_mode == "flat":
             source = self.warped
         if source is None:
-            self.canvas.create_text(20, 20, anchor="nw", fill="white", text="Choose an MCMDU image.")
+            self.canvas.create_text(20, 20, anchor="nw", fill="white", text="Choose an MCDU image.")
             return
         canvas_w = max(1, self.canvas.winfo_width())
         canvas_h = max(1, self.canvas.winfo_height())
