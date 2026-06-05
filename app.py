@@ -40,6 +40,7 @@ LAST_DATA_COL = 38
 SCREEN_W = 1600
 MIN_SCREEN_H = 900
 MAX_SCREEN_H = 1400
+OCR_WHITELIST = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789°º˚/.-<>"
 
 
 def find_tesseract() -> str:
@@ -258,7 +259,7 @@ def run_tesseract_tsv(image: Image.Image) -> list[dict[str, Any]]:
             "-l",
             "eng",
             "-c",
-            "tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789°/.-<>",
+            f"tessedit_char_whitelist={OCR_WHITELIST}",
             "tsv",
         ]
         try:
@@ -311,7 +312,7 @@ def run_tesseract_boxes(image: Image.Image) -> list[dict[str, Any]]:
             "-l",
             "eng",
             "-c",
-            "tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789°/.-<>",
+            f"tessedit_char_whitelist={OCR_WHITELIST}",
             "makebox",
         ]
         try:
@@ -350,6 +351,9 @@ def run_tesseract_boxes(image: Image.Image) -> list[dict[str, Any]]:
 
 def clean_ocr_text(text: str) -> str:
     text = text.replace("|", "I")
+    text = text.replace("º", "°").replace("˚", "°").replace("Â°", "°")
+    text = re.sub(r"(?<=\d{3})[oO07](?=/)", "°", text)
+    text = re.sub(r"\b(\d{3})(?=/\d)", r"\1°", text)
     text = re.sub(r"\s+", " ", text)
     return text.strip()
 
