@@ -1,5 +1,7 @@
 const ROWS = 13;
 const COLS = 40;
+const FIRST_DATA_COL = 1;
+const LAST_DATA_COL = 38;
 
 const canvas = document.querySelector("#imageCanvas");
 const ctx = canvas.getContext("2d");
@@ -41,6 +43,16 @@ function setStatus(message) {
 
 function makeEmptyGrid() {
   return Array.from({ length: ROWS }, () => Array.from({ length: COLS }, () => ""));
+}
+
+function normalizeGridGuards(grid) {
+  const normalized = makeEmptyGrid();
+  for (let row = 0; row < ROWS; row += 1) {
+    for (let col = FIRST_DATA_COL; col <= LAST_DATA_COL; col += 1) {
+      normalized[row][col] = grid[row]?.[col] || "";
+    }
+  }
+  return normalized;
 }
 
 function fitCanvas() {
@@ -374,7 +386,11 @@ function renderGridTable(grid = makeEmptyGrid()) {
       td.contentEditable = "true";
       td.dataset.row = String(row);
       td.dataset.col = String(col);
-      td.textContent = grid[row]?.[col]?.trim() || "";
+      td.textContent = col >= FIRST_DATA_COL && col <= LAST_DATA_COL ? grid[row]?.[col]?.trim() || "" : "";
+      if (col < FIRST_DATA_COL || col > LAST_DATA_COL) {
+        td.contentEditable = "false";
+        td.classList.add("guard-cell");
+      }
       td.addEventListener("input", () => {
         exportButton.disabled = false;
         rememberButton.disabled = false;
@@ -391,13 +407,15 @@ function getCurrentGrid() {
   gridTable.querySelectorAll("td[contenteditable='true']").forEach((cell) => {
     const row = Number(cell.dataset.row);
     const col = Number(cell.dataset.col);
-    grid[row][col] = cell.textContent.slice(0, 8).trim();
+    if (col >= FIRST_DATA_COL && col <= LAST_DATA_COL) {
+      grid[row][col] = cell.textContent.slice(0, 8).trim();
+    }
   });
-  return grid;
+  return normalizeGridGuards(grid);
 }
 
 function gridRowText(row) {
-  return row.map((cell) => (cell || " ").slice(0, 1)).join("").slice(0, COLS).padEnd(COLS, " ");
+  return normalizeGridGuards([row])[0].map((cell) => (cell || " ").slice(0, 1)).join("").slice(0, COLS).padEnd(COLS, " ");
 }
 
 async function postJson(url, body) {
@@ -587,8 +605,8 @@ analyzeButton.addEventListener("click", async () => {
       image: state.imageDataUrl,
       corners: getGridCorners(),
     });
-    state.sourceGrid = result.grid;
-    renderGridTable(result.grid);
+    state.sourceGrid = normalizeGridGuards(result.grid);
+    renderGridTable(state.sourceGrid);
     exportButton.disabled = false;
     rememberButton.disabled = false;
     const boxCount = Array.isArray(result.boxes) ? result.boxes.length : 0;

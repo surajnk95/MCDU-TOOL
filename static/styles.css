@@ -239,6 +239,11 @@ td[contenteditable="true"]:focus {
   box-shadow: inset 0 0 0 2px var(--warn);
 }
 
+td.guard-cell {
+  background: #f3f6f7;
+  color: transparent;
+}
+
 @media (max-width: 980px) {
   .workspace {
     grid-template-columns: 1fr;

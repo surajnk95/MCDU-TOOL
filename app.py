@@ -34,6 +34,8 @@ TEMPLATES = DATA / "templates.json"
 
 ROWS = 13
 COLS = 40
+FIRST_DATA_COL = 1
+LAST_DATA_COL = 38
 SCREEN_W = 1600
 MIN_SCREEN_H = 900
 MAX_SCREEN_H = 1400
@@ -326,6 +328,18 @@ def empty_grid() -> list[list[str]]:
     return [["" for _ in range(COLS)] for _ in range(ROWS)]
 
 
+def clamp_data_col(col: int) -> int:
+    return max(FIRST_DATA_COL, min(LAST_DATA_COL, col))
+
+
+def normalize_grid_guards(grid: list[list[str]]) -> list[list[str]]:
+    normalized = [[cell for cell in row[:COLS]] + [""] * max(0, COLS - len(row)) for row in grid[:ROWS]]
+    for row in normalized:
+        row[0] = ""
+        row[COLS - 1] = ""
+    return normalized
+
+
 def place_char(grid: list[list[str]], char_box: dict[str, Any], screen_size: tuple[int, int]) -> bool:
     text = clean_ocr_text(str(char_box["text"]))[:1]
     if not text:
@@ -342,12 +356,12 @@ def place_char(grid: list[list[str]], char_box: dict[str, Any], screen_size: tup
     center_x = float(char_box["left"]) + box_w * 0.5
     center_y = float(char_box["top"]) + box_h * 0.5
     row = max(0, min(ROWS - 1, int(center_y / cell_h)))
-    col = max(0, min(COLS - 1, int(center_x / cell_w)))
+    col = clamp_data_col(int(center_x / cell_w))
 
     if grid[row][col] and grid[row][col] != text:
         for offset in (-1, 1, -2, 2):
             next_col = col + offset
-            if 0 <= next_col < COLS and not grid[row][next_col]:
+            if FIRST_DATA_COL <= next_col <= LAST_DATA_COL and not grid[row][next_col]:
                 col = next_col
                 break
     if not grid[row][col]:
@@ -365,14 +379,17 @@ def place_word(grid: list[list[str]], word: dict[str, Any], screen_size: tuple[i
     cell_w = screen_w / COLS
     cell_h = screen_h / ROWS
     row = max(0, min(ROWS - 1, int((word["top"] + word["height"] * 0.5) / cell_h)))
-    start_col = max(0, min(COLS - 1, int(word["left"] / cell_w)))
+    start_col = clamp_data_col(int(word["left"] / cell_w))
 
     compact = text.replace(" ", "")
     if not compact:
         return
-    while start_col < COLS and grid[row][start_col]:
+    while start_col <= LAST_DATA_COL and grid[row][start_col]:
         start_col += 1
-    for index, char in enumerate(compact[: COLS - start_col]):
+    if start_col > LAST_DATA_COL:
+        return
+    max_len = LAST_DATA_COL - start_col + 1
+    for index, char in enumerate(compact[:max_len]):
         col = start_col + index
         if not grid[row][col]:
             grid[row][col] = char
@@ -516,9 +533,9 @@ def apply_corrections(grid: list[list[str]]) -> list[list[str]]:
         row_text = "".join(cell or " " for cell in row)
         normalized = re.sub(r"\s+", " ", row_text).strip()
         if normalized in corrections:
-            corrected = corrections[normalized][:COLS]
-            updated[row_index] = list(corrected.ljust(COLS))
-    return updated
+            corrected = corrections[normalized][:COLS].ljust(COLS)
+            updated[row_index] = list(corrected)
+    return normalize_grid_guards(updated)
 
 
 def apply_templates(grid: list[list[str]], warped: Image.Image) -> list[list[str]]:
@@ -539,6 +556,8 @@ def apply_templates(grid: list[list[str]], warped: Image.Image) -> list[list[str
             crop = gray[y1:y2, x1:x2]
             if crop.size == 0 or float(crop.max()) < 105:
                 continue
+            if col < FIRST_DATA_COL or col > LAST_DATA_COL:
+                continue
             classified = classify_from_templates(cell_feature(warped, row, col), templates)
             if classified and not updated[row][col]:
                 updated[row][col] = classified[0]
@@ -546,7 +565,7 @@ def apply_templates(grid: list[list[str]], warped: Image.Image) -> list[list[str
 
 
 def grid_character_count(grid: list[list[str]]) -> int:
-    return sum(1 for row in grid for cell in row if cell)
+    return sum(1 for row in grid for cell in row[FIRST_DATA_COL : LAST_DATA_COL + 1] if cell)
 
 
 def remember_templates(payload: dict[str, Any]) -> dict[str, Any]:
@@ -565,6 +584,8 @@ def remember_templates(payload: dict[str, Any]) -> dict[str, Any]:
         if not isinstance(row, list):
             continue
         for col_index, value in enumerate(row[:COLS]):
+            if col_index < FIRST_DATA_COL or col_index > LAST_DATA_COL:
+                continue
             char = clean_ocr_text(str(value))[:1]
             if not char or char.isspace():
                 continue
@@ -592,7 +613,7 @@ def analyze(payload: dict[str, Any]) -> dict[str, Any]:
     if grid_character_count(grid) < 8:
         for box in boxes:
             place_char(grid, box, screen_size)
-    corrected_grid = apply_corrections(grid)
+    corrected_grid = normalize_grid_guards(apply_corrections(grid))
 
     preview_id = f"{uuid.uuid4().hex}.png"
     preview_path = EXPORTS / preview_id
@@ -634,7 +655,9 @@ def export_docx(payload: dict[str, Any]) -> dict[str, str]:
         cells[0].text = str(row_index + 1)
         for col_index in range(COLS):
             value = ""
-            if row_index < len(grid) and isinstance(grid[row_index], list) and col_index < len(grid[row_index]):
+            if col_index in (0, COLS - 1):
+                value = ""
+            elif row_index < len(grid) and isinstance(grid[row_index], list) and col_index < len(grid[row_index]):
                 value = str(grid[row_index][col_index])
             cells[col_index + 1].text = value.strip()
             cells[col_index + 1].vertical_alignment = WD_CELL_VERTICAL_ALIGNMENT.CENTER
@@ -653,7 +676,10 @@ def remember(payload: dict[str, Any]) -> dict[str, Any]:
     original_raw = str(payload.get("original", ""))
     corrected_raw = str(payload.get("corrected", ""))
     original = re.sub(r"\s+", " ", original_raw).strip()
-    corrected = corrected_raw[:COLS].ljust(COLS)
+    corrected_list = list(corrected_raw[:COLS].ljust(COLS))
+    corrected_list[0] = " "
+    corrected_list[COLS - 1] = " "
+    corrected = "".join(corrected_list)
     if not original or not corrected.strip():
         raise ValueError("Both original and corrected text are required.")
 
