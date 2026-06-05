@@ -643,7 +643,7 @@ rememberButton.addEventListener("click", async () => {
   for (let row = 0; row < ROWS; row += 1) {
     const original = gridRowText(state.sourceGrid[row] || []);
     const corrected = gridRowText(current[row] || []);
-    if (original && corrected && original !== corrected) {
+    if (original.trim() && corrected.trim() && original !== corrected) {
       changes.push({ original, corrected });
     }
   }

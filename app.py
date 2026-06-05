@@ -715,7 +715,7 @@ def remember(payload: dict[str, Any]) -> dict[str, Any]:
     corrected_list[COLS - 1] = " "
     corrected = "".join(corrected_list)
     if not original or not corrected.strip():
-        raise ValueError("Both original and corrected text are required.")
+        return {"count": len(load_corrections()), "skipped": True}
 
     corrections = load_corrections()
     corrections[original] = corrected
