@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import csv
+import difflib
 import io
 import json
 import os
@@ -422,6 +423,7 @@ def place_word(grid: list[list[str]], word: dict[str, Any], screen_size: tuple[i
     compact = text.replace(" ", "")
     if not compact:
         return
+
     while start_col <= LAST_DATA_COL and grid[row][start_col]:
         start_col += 1
     if start_col > LAST_DATA_COL:
@@ -564,15 +566,41 @@ def save_corrections(corrections: dict[str, str]) -> None:
     CORRECTIONS.write_text(json.dumps(corrections, indent=2, sort_keys=True), encoding="utf-8")
 
 
+def compact_row_text(value: str) -> str:
+    return re.sub(r"\s+", "", clean_ocr_text(value)).upper()
+
+
 def apply_corrections(grid: list[list[str]]) -> list[list[str]]:
     corrections = load_corrections()
     updated = [[cell for cell in row] for row in grid]
+    compact_corrections = {compact_row_text(key): value for key, value in corrections.items() if compact_row_text(key)}
     for row_index, row in enumerate(updated):
         row_text = "".join(cell or " " for cell in row)
         normalized = re.sub(r"\s+", " ", row_text).strip()
         if normalized in corrections:
             corrected = corrections[normalized][:COLS].ljust(COLS)
             updated[row_index] = list(corrected)
+            continue
+
+        compact = compact_row_text(row_text)
+        if compact in compact_corrections:
+            corrected = compact_corrections[compact][:COLS].ljust(COLS)
+            updated[row_index] = list(corrected)
+            continue
+
+        if len(compact) >= 4:
+            best_key = ""
+            best_ratio = 0.0
+            for key in compact_corrections:
+                if abs(len(key) - len(compact)) > 4:
+                    continue
+                ratio = difflib.SequenceMatcher(None, compact, key).ratio()
+                if ratio > best_ratio:
+                    best_key = key
+                    best_ratio = ratio
+            if best_key and best_ratio >= 0.86:
+                corrected = compact_corrections[best_key][:COLS].ljust(COLS)
+                updated[row_index] = list(corrected)
     return normalize_grid_guards(updated)
 
 
@@ -604,6 +632,30 @@ def apply_templates(grid: list[list[str]], warped: Image.Image) -> list[list[str
 
 def grid_character_count(grid: list[list[str]]) -> int:
     return sum(1 for row in grid for cell in row[FIRST_DATA_COL : LAST_DATA_COL + 1] if cell)
+
+
+def verify_grid_with_char_boxes(
+    word_grid: list[list[str]],
+    char_boxes: list[dict[str, Any]],
+    screen_size: tuple[int, int],
+) -> list[list[str]]:
+    verified = [[cell for cell in row] for row in word_grid]
+    char_grid = empty_grid()
+    for box in char_boxes:
+        place_char(char_grid, box, screen_size)
+
+    for row in range(ROWS):
+        for col in range(FIRST_DATA_COL, LAST_DATA_COL + 1):
+            char_value = char_grid[row][col]
+            if not char_value or verified[row][col]:
+                continue
+            nearby_same = any(
+                verified[row][nearby] == char_value
+                for nearby in range(max(FIRST_DATA_COL, col - 2), min(LAST_DATA_COL, col + 2) + 1)
+            )
+            if nearby_same:
+                verified[row][col] = char_value
+    return normalize_grid_guards(verified)
 
 
 def remember_templates(payload: dict[str, Any]) -> dict[str, Any]:
@@ -651,6 +703,8 @@ def analyze(payload: dict[str, Any]) -> dict[str, Any]:
     if grid_character_count(grid) < 8:
         for box in boxes:
             place_char(grid, box, screen_size)
+    else:
+        grid = verify_grid_with_char_boxes(grid, boxes, screen_size)
     corrected_grid = normalize_grid_guards(apply_corrections(grid))
 
     preview_id = f"{uuid.uuid4().hex}.png"
