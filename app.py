@@ -6,6 +6,7 @@ import io
 import json
 import os
 import re
+import shutil
 import subprocess
 import tempfile
 import uuid
@@ -39,7 +40,28 @@ LAST_DATA_COL = 38
 SCREEN_W = 1600
 MIN_SCREEN_H = 900
 MAX_SCREEN_H = 1400
-TESSERACT = "/opt/homebrew/bin/tesseract"
+
+
+def find_tesseract() -> str:
+    configured = os.environ.get("TESSERACT_CMD")
+    if configured:
+        return configured
+    found = shutil.which("tesseract")
+    if found:
+        return found
+    candidates = [
+        Path("/opt/homebrew/bin/tesseract"),
+        Path("/usr/local/bin/tesseract"),
+        Path("C:/Program Files/Tesseract-OCR/tesseract.exe"),
+        Path("C:/Program Files (x86)/Tesseract-OCR/tesseract.exe"),
+    ]
+    for candidate in candidates:
+        if candidate.exists():
+            return str(candidate)
+    return "tesseract"
+
+
+TESSERACT = find_tesseract()
 
 
 def ensure_dirs() -> None:
@@ -239,7 +261,12 @@ def run_tesseract_tsv(image: Image.Image) -> list[dict[str, Any]]:
             "tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789°/.-<>",
             "tsv",
         ]
-        completed = subprocess.run(command, capture_output=True, text=True, check=False)
+        try:
+            completed = subprocess.run(command, capture_output=True, text=True, check=False)
+        except FileNotFoundError as exc:
+            raise RuntimeError(
+                "Tesseract OCR was not found. Install Tesseract OCR, or set TESSERACT_CMD to the full tesseract.exe path."
+            ) from exc
         if completed.returncode != 0:
             raise RuntimeError(completed.stderr.strip() or "Tesseract OCR failed.")
 
@@ -287,7 +314,10 @@ def run_tesseract_boxes(image: Image.Image) -> list[dict[str, Any]]:
             "tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789°/.-<>",
             "makebox",
         ]
-        completed = subprocess.run(command, capture_output=True, text=True, check=False)
+        try:
+            completed = subprocess.run(command, capture_output=True, text=True, check=False)
+        except FileNotFoundError:
+            return []
         if completed.returncode != 0:
             return []
 
@@ -720,6 +750,7 @@ class McmduHandler(SimpleHTTPRequestHandler):
             else:
                 json_response(self, HTTPStatus.NOT_FOUND, {"error": "Unknown endpoint."})
         except Exception as exc:  # noqa: BLE001 - API boundary should return useful errors.
+            print(f"{self.path} failed: {exc}")
             json_response(self, HTTPStatus.BAD_REQUEST, {"error": str(exc)})
 
 
