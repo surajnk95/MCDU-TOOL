@@ -498,7 +498,7 @@ def detect_display(payload: dict[str, Any]) -> dict[str, Any]:
             or component["x2"] >= small.width - 2
             or component["y2"] >= small.height - 2
         )
-        if area < image_area * 0.08 or aspect < 0.75 or aspect > 2.2:
+        if area < image_area * 0.08 or aspect < 0.75 or aspect > 3.2:
             continue
         score = component["count"] * min(1.0, component["fill"] * 1.4)
         if touches_edge:
