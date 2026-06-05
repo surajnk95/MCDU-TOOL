@@ -42,6 +42,28 @@ SCREEN_W = 1600
 MIN_SCREEN_H = 900
 MAX_SCREEN_H = 1400
 OCR_WHITELIST = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789°º˚/.-<>"
+MCDU_WORD_HINTS = {
+    "ACT",
+    "RTE",
+    "LEGS",
+    "CRZ",
+    "ALT",
+    "SPD",
+    "LRC",
+    "D/D",
+    "ECON",
+    "RTA",
+    "STEP",
+    "ENG",
+    "OUT",
+    "FUEL",
+    "RECMD",
+    "MAX",
+    "OPT",
+    "TO",
+    "SEL",
+    "FL",
+}
 
 
 def find_tesseract() -> str:
@@ -245,56 +267,96 @@ def classify_from_templates(feature: list[float], templates: dict[str, list[list
     return None
 
 
+def word_quality(word: dict[str, Any]) -> float:
+    text = clean_ocr_text(str(word.get("text", ""))).upper()
+    compact = text.replace(" ", "")
+    score = max(0.0, float(word.get("conf") or 0.0))
+    score += min(len(compact), 12) * 3.0
+    for hint in MCDU_WORD_HINTS:
+        if hint in compact:
+            score += 35.0
+    if re.fullmatch(r"\d+/\d+", compact):
+        score += 25.0
+    if re.fullmatch(r"FL\d{2,3}", compact):
+        score += 30.0
+    return score
+
+
 def run_tesseract_tsv(image: Image.Image) -> list[dict[str, Any]]:
     ensure_dirs()
     with tempfile.TemporaryDirectory() as temp_dir:
         source = Path(temp_dir) / "screen.png"
         image.save(source)
 
-        command = [
-            TESSERACT,
-            str(source),
-            "stdout",
-            "--psm",
-            "11",
-            "-l",
-            "eng",
-            "-c",
-            f"tessedit_char_whitelist={OCR_WHITELIST}",
-            "tsv",
-        ]
-        try:
-            completed = subprocess.run(command, capture_output=True, text=True, check=False)
-        except FileNotFoundError as exc:
-            raise RuntimeError(
-                "Tesseract OCR was not found. Install Tesseract OCR, or set TESSERACT_CMD to the full tesseract.exe path."
-            ) from exc
-        if completed.returncode != 0:
-            raise RuntimeError(completed.stderr.strip() or "Tesseract OCR failed.")
-
-        rows = csv.DictReader(io.StringIO(completed.stdout), delimiter="\t")
-        words: list[dict[str, Any]] = []
-        for row in rows:
-            text = (row.get("text") or "").strip()
-            if not text:
-                continue
+        candidates: list[list[dict[str, Any]]] = []
+        last_error = ""
+        for psm in ("11", "12", "6", "3", "4"):
+            command = [
+                TESSERACT,
+                str(source),
+                "stdout",
+                "--psm",
+                psm,
+                "-l",
+                "eng",
+                "-c",
+                f"tessedit_char_whitelist={OCR_WHITELIST}",
+                "tsv",
+            ]
             try:
-                conf = float(row.get("conf") or -1)
-            except ValueError:
-                conf = -1
-            if conf < 0:
+                completed = subprocess.run(command, capture_output=True, text=True, check=False)
+            except FileNotFoundError as exc:
+                raise RuntimeError(
+                    "Tesseract OCR was not found. Install Tesseract OCR, or set TESSERACT_CMD to the full tesseract.exe path."
+                ) from exc
+            if completed.returncode != 0:
+                last_error = completed.stderr.strip()
                 continue
-            words.append(
+
+            rows = csv.DictReader(io.StringIO(completed.stdout), delimiter="\t")
+            words: list[dict[str, Any]] = []
+            for row in rows:
+                text = clean_ocr_text((row.get("text") or "").strip())
+                if not text:
+                    continue
+                try:
+                    conf = float(row.get("conf") or -1)
+                except ValueError:
+                    conf = -1
+                if conf < 0:
+                    continue
+                words.append(
+                    {
+                        "text": text,
+                        "conf": conf,
+                        "left": int(row.get("left") or 0),
+                        "top": int(row.get("top") or 0),
+                        "width": int(row.get("width") or 0),
+                        "height": int(row.get("height") or 0),
+                        "psm": psm,
+                    }
+                )
+            if words:
+                candidates.append(words)
+        if not candidates and last_error:
+            raise RuntimeError(last_error or "Tesseract OCR failed.")
+        if not candidates:
+            return []
+
+        def candidate_score(candidate: list[dict[str, Any]]) -> float:
+            score = sum(word_quality(word) for word in candidate)
+            row_count = len(
                 {
-                    "text": text,
-                    "conf": conf,
-                    "left": int(row.get("left") or 0),
-                    "top": int(row.get("top") or 0),
-                    "width": int(row.get("width") or 0),
-                    "height": int(row.get("height") or 0),
+                    int((float(word["top"]) + float(word["height"]) * 0.5) / max(1.0, image.height / ROWS))
+                    for word in candidate
                 }
             )
-        return words
+            score += row_count * 18.0
+            score -= sum(20.0 for word in candidate if len(str(word["text"])) > 18)
+            return score
+
+        best = max(candidates, key=candidate_score)
+        return sorted(best, key=lambda item: (int(item["top"]), int(item["left"])))
 
 
 def run_tesseract_boxes(image: Image.Image) -> list[dict[str, Any]]:
@@ -424,10 +486,6 @@ def place_word(grid: list[list[str]], word: dict[str, Any], screen_size: tuple[i
     if not compact:
         return
 
-    while start_col <= LAST_DATA_COL and grid[row][start_col]:
-        start_col += 1
-    if start_col > LAST_DATA_COL:
-        return
     max_len = LAST_DATA_COL - start_col + 1
     for index, char in enumerate(compact[:max_len]):
         col = start_col + index
@@ -703,8 +761,6 @@ def analyze(payload: dict[str, Any]) -> dict[str, Any]:
     if grid_character_count(grid) < 8:
         for box in boxes:
             place_char(grid, box, screen_size)
-    else:
-        grid = verify_grid_with_char_boxes(grid, boxes, screen_size)
     corrected_grid = normalize_grid_guards(apply_corrections(grid))
 
     preview_id = f"{uuid.uuid4().hex}.png"
