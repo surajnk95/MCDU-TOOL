@@ -332,6 +332,10 @@ def clamp_data_col(col: int) -> int:
     return max(FIRST_DATA_COL, min(LAST_DATA_COL, col))
 
 
+def nearest_data_col(x: float, cell_w: float) -> int:
+    return clamp_data_col(int(round(x / cell_w)))
+
+
 def normalize_grid_guards(grid: list[list[str]]) -> list[list[str]]:
     normalized = [[cell for cell in row[:COLS]] + [""] * max(0, COLS - len(row)) for row in grid[:ROWS]]
     for row in normalized:
@@ -379,7 +383,7 @@ def place_word(grid: list[list[str]], word: dict[str, Any], screen_size: tuple[i
     cell_w = screen_w / COLS
     cell_h = screen_h / ROWS
     row = max(0, min(ROWS - 1, int((word["top"] + word["height"] * 0.5) / cell_h)))
-    start_col = clamp_data_col(int(word["left"] / cell_w))
+    start_col = nearest_data_col(float(word["left"]), cell_w)
 
     compact = text.replace(" ", "")
     if not compact:
