@@ -1,4 +1,8 @@
 __pycache__/
 *.pyc
+data/corrections.json
+data/templates.json
 data/exports/*
 !data/exports/.gitkeep
+single_python_version/corrections.json
+single_python_version/templates.json
