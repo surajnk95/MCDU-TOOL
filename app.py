@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import csv
 import difflib
+import hashlib
 import io
 import json
 import os
@@ -33,6 +34,7 @@ DATA = ROOT / "data"
 EXPORTS = DATA / "exports"
 CORRECTIONS = DATA / "corrections.json"
 TEMPLATES = DATA / "templates.json"
+REQUIREMENTS = DATA / "requirements.json"
 
 ROWS = 13
 COLS = 40
@@ -95,6 +97,8 @@ def ensure_dirs() -> None:
         CORRECTIONS.write_text("{}", encoding="utf-8")
     if not TEMPLATES.exists():
         TEMPLATES.write_text("{}", encoding="utf-8")
+    if not REQUIREMENTS.exists():
+        REQUIREMENTS.write_text('{"text": "", "rules": []}', encoding="utf-8")
 
 
 def json_response(handler: SimpleHTTPRequestHandler, status: int, payload: dict[str, Any]) -> None:
@@ -119,6 +123,11 @@ def load_image(data_url: str) -> Image.Image:
         data_url = data_url.split(",", 1)[1]
     raw = base64.b64decode(data_url)
     return ImageOps.exif_transpose(Image.open(io.BytesIO(raw))).convert("RGB")
+
+
+def image_signature(data_url: str) -> str:
+    encoded = data_url.split(",", 1)[1] if "," in data_url else data_url
+    return hashlib.sha256(encoded.encode("ascii", errors="ignore")).hexdigest()[:24]
 
 
 def edge_length(a: dict[str, float], b: dict[str, float]) -> float:
@@ -670,32 +679,147 @@ def save_corrections(corrections: dict[str, str]) -> None:
     CORRECTIONS.write_text(json.dumps(corrections, indent=2, sort_keys=True), encoding="utf-8")
 
 
+def parse_requirements(text: str) -> tuple[list[dict[str, Any]], list[str]]:
+    rules: list[dict[str, Any]] = []
+    errors: list[str] = []
+    pattern = re.compile(
+        r"^\s*ROW\s+(\d{1,2})\s+(?:COL|COLS|COLUMN|COLUMNS)\s+(\d{1,2})(?:\s*-\s*(\d{1,2}))?\s*[:=]\s*(.*?)\s*$",
+        re.IGNORECASE,
+    )
+    for line_number, raw_line in enumerate(text.splitlines(), 1):
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        match = pattern.match(raw_line)
+        if not match:
+            errors.append(f"Line {line_number}: use ROW n COL start-end = text")
+            continue
+        row = int(match.group(1))
+        start = int(match.group(2))
+        end = int(match.group(3) or start)
+        value = match.group(4)
+        if not 1 <= row <= ROWS or not 1 <= start <= end <= 38:
+            errors.append(f"Line {line_number}: row must be 1-13 and columns must be 1-38")
+            continue
+        if not value:
+            errors.append(f"Line {line_number}: requirement text cannot be blank")
+            continue
+        rules.append({"row": row - 1, "start": start, "end": end, "value": value})
+    return rules, errors
+
+
+def load_requirements() -> dict[str, Any]:
+    ensure_dirs()
+    try:
+        data = json.loads(REQUIREMENTS.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        data = {"text": "", "rules": []}
+    return {
+        "text": str(data.get("text", "")),
+        "rules": data.get("rules", []) if isinstance(data.get("rules"), list) else [],
+    }
+
+
+def save_requirements(payload: dict[str, Any]) -> dict[str, Any]:
+    text = str(payload.get("text", ""))
+    rules, errors = parse_requirements(text)
+    if errors:
+        raise ValueError(" ".join(errors))
+    data = {"text": text, "rules": rules}
+    REQUIREMENTS.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    return {"text": text, "rules": rules, "count": len(rules)}
+
+
+def apply_requirements(grid: list[list[str]]) -> list[list[str]]:
+    updated = [[cell for cell in row] for row in grid]
+    for rule in load_requirements()["rules"]:
+        try:
+            row = int(rule["row"])
+            start = int(rule["start"])
+            end = int(rule["end"])
+            value = str(rule["value"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if not 0 <= row < ROWS or not FIRST_DATA_COL <= start <= end <= LAST_DATA_COL:
+            continue
+        width = end - start + 1
+        content = value * width if len(value) == 1 else value.ljust(width)
+        for offset, char in enumerate(content[:width]):
+            updated[row][start + offset] = "" if char == " " else char
+    return normalize_grid_guards(updated)
+
+
 def compact_row_text(value: str) -> str:
     return re.sub(r"\s+", "", clean_ocr_text(value)).upper()
 
 
-def apply_corrections(grid: list[list[str]]) -> list[list[str]]:
+def fixed_row_text(value: str) -> str:
+    return value[:COLS].ljust(COLS)
+
+
+def correction_key(row: int, original: str) -> str:
+    return f"row:{row + 1}|{fixed_row_text(original)}"
+
+
+def apply_corrections(grid: list[list[str]], image_id: str = "") -> list[list[str]]:
     corrections = load_corrections()
     updated = [[cell for cell in row] for row in grid]
-    compact_corrections = {compact_row_text(key): value for key, value in corrections.items() if compact_row_text(key)}
+    legacy_corrections = {
+        key: value
+        for key, value in corrections.items()
+        if not key.startswith("row:") and not key.startswith("image:")
+    }
+    compact_corrections = {
+        compact_row_text(key): value for key, value in legacy_corrections.items() if compact_row_text(key)
+    }
     for row_index, row in enumerate(updated):
-        row_text = "".join(cell or " " for cell in row)
+        image_key = f"image:{image_id}|row:{row_index + 1}"
+        if image_id and image_key in corrections:
+            updated[row_index] = list(fixed_row_text(corrections[image_key]))
+            continue
+
+        row_text = fixed_row_text("".join(cell or " " for cell in row))
+        exact_key = correction_key(row_index, row_text)
+        if exact_key in corrections:
+            updated[row_index] = list(fixed_row_text(corrections[exact_key]))
+            continue
+
         normalized = re.sub(r"\s+", " ", row_text).strip()
-        if normalized in corrections:
-            corrected = corrections[normalized][:COLS].ljust(COLS)
+        row_prefix = f"row:{row_index + 1}|"
+        row_candidates = {
+            key[len(row_prefix) :]: value for key, value in corrections.items() if key.startswith(row_prefix)
+        }
+        normalized_candidates = {
+            re.sub(r"\s+", " ", key).strip(): value for key, value in row_candidates.items()
+        }
+        if normalized in normalized_candidates:
+            corrected = fixed_row_text(normalized_candidates[normalized])
+            updated[row_index] = list(corrected)
+            continue
+
+        if normalized in legacy_corrections:
+            corrected = fixed_row_text(legacy_corrections[normalized])
             updated[row_index] = list(corrected)
             continue
 
         compact = compact_row_text(row_text)
+        row_compact = {
+            compact_row_text(key): value for key, value in row_candidates.items() if compact_row_text(key)
+        }
+        if compact in row_compact:
+            updated[row_index] = list(fixed_row_text(row_compact[compact]))
+            continue
+
         if compact in compact_corrections:
-            corrected = compact_corrections[compact][:COLS].ljust(COLS)
+            corrected = fixed_row_text(compact_corrections[compact])
             updated[row_index] = list(corrected)
             continue
 
         if len(compact) >= 4:
             best_key = ""
             best_ratio = 0.0
-            for key in compact_corrections:
+            candidates = row_compact or compact_corrections
+            for key in candidates:
                 if abs(len(key) - len(compact)) > 4:
                     continue
                 ratio = difflib.SequenceMatcher(None, compact, key).ratio()
@@ -703,7 +827,7 @@ def apply_corrections(grid: list[list[str]]) -> list[list[str]]:
                     best_key = key
                     best_ratio = ratio
             if best_key and best_ratio >= 0.86:
-                corrected = compact_corrections[best_key][:COLS].ljust(COLS)
+                corrected = fixed_row_text(candidates[best_key])
                 updated[row_index] = list(corrected)
     return normalize_grid_guards(updated)
 
@@ -862,7 +986,9 @@ def analyze(payload: dict[str, Any]) -> dict[str, Any]:
         for box in boxes:
             place_char(grid, box, screen_size)
     grid = recover_dash_lines(grid, warped)
-    corrected_grid = normalize_grid_guards(apply_corrections(grid))
+    grid = apply_templates(grid, warped)
+    grid = apply_corrections(grid, image_signature(str(payload["image"])))
+    corrected_grid = apply_requirements(grid)
 
     preview_id = f"{uuid.uuid4().hex}.png"
     preview_path = EXPORTS / preview_id
@@ -924,18 +1050,55 @@ def export_docx(payload: dict[str, Any]) -> dict[str, str]:
 def remember(payload: dict[str, Any]) -> dict[str, Any]:
     original_raw = str(payload.get("original", ""))
     corrected_raw = str(payload.get("corrected", ""))
-    original = re.sub(r"\s+", " ", original_raw).strip()
-    corrected_list = list(corrected_raw[:COLS].ljust(COLS))
+    row = int(payload.get("row", 0))
+    if not 0 <= row < ROWS:
+        raise ValueError("Correction row must be between 1 and 13.")
+
+    original = fixed_row_text(original_raw)
+    corrected_list = list(fixed_row_text(corrected_raw))
     corrected_list[0] = " "
     corrected_list[COLS - 1] = " "
     corrected = "".join(corrected_list)
-    if not original or not corrected.strip():
+    if not corrected.strip():
         return {"count": len(load_corrections()), "skipped": True}
 
     corrections = load_corrections()
-    corrections[original] = corrected
+    corrections[correction_key(row, original)] = corrected
     save_corrections(corrections)
     return {"count": len(corrections)}
+
+
+def remember_grid(payload: dict[str, Any]) -> dict[str, Any]:
+    image_data = str(payload.get("image", ""))
+    source_grid = payload.get("sourceGrid")
+    corrected_grid = payload.get("grid")
+    if not image_data:
+        raise ValueError("An image is required to remember its corrected grid.")
+    if not isinstance(source_grid, list) or not isinstance(corrected_grid, list):
+        raise ValueError("Source and corrected 13-row grids are required.")
+
+    signature = image_signature(image_data)
+    corrections = load_corrections()
+    saved = 0
+    for row in range(ROWS):
+        original = grid_row_from_payload(source_grid, row)
+        corrected = grid_row_from_payload(corrected_grid, row)
+        if original == corrected:
+            continue
+        if corrected.strip():
+            corrections[correction_key(row, original)] = corrected
+        corrections[f"image:{signature}|row:{row + 1}"] = corrected
+        saved += 1
+    save_corrections(corrections)
+    return {"count": len(corrections), "saved": saved}
+
+
+def grid_row_from_payload(grid: list[Any], row: int) -> str:
+    values = grid[row] if row < len(grid) and isinstance(grid[row], list) else []
+    cells = [str(values[col])[:1] if col < len(values) else "" for col in range(COLS)]
+    cells[0] = ""
+    cells[COLS - 1] = ""
+    return fixed_row_text("".join(cell or " " for cell in cells))
 
 
 class McmduHandler(SimpleHTTPRequestHandler):
@@ -960,8 +1123,14 @@ class McmduHandler(SimpleHTTPRequestHandler):
                 json_response(self, HTTPStatus.OK, export_docx(payload))
             elif self.path == "/api/remember":
                 json_response(self, HTTPStatus.OK, remember(payload))
+            elif self.path == "/api/remember-grid":
+                json_response(self, HTTPStatus.OK, remember_grid(payload))
             elif self.path == "/api/remember-templates":
                 json_response(self, HTTPStatus.OK, remember_templates(payload))
+            elif self.path == "/api/requirements":
+                json_response(self, HTTPStatus.OK, save_requirements(payload))
+            elif self.path == "/api/requirements/load":
+                json_response(self, HTTPStatus.OK, load_requirements())
             else:
                 json_response(self, HTTPStatus.NOT_FOUND, {"error": "Unknown endpoint."})
         except Exception as exc:  # noqa: BLE001 - API boundary should return useful errors.

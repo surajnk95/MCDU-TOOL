@@ -16,6 +16,8 @@ const detectButton = document.querySelector("#detectButton");
 const photoViewButton = document.querySelector("#photoViewButton");
 const flatViewButton = document.querySelector("#flatViewButton");
 const gridTable = document.querySelector("#gridTable");
+const requirementsInput = document.querySelector("#requirementsInput");
+const saveRequirementsButton = document.querySelector("#saveRequirementsButton");
 
 const insetInputs = {
   left: document.querySelector("#leftInset"),
@@ -431,6 +433,15 @@ async function postJson(url, body) {
   return payload;
 }
 
+async function loadRequirements() {
+  try {
+    const result = await postJson("/api/requirements/load", {});
+    requirementsInput.value = result.text || "";
+  } catch (error) {
+    setStatus(error.message);
+  }
+}
+
 async function autoDetectDisplay() {
   if (!state.imageDataUrl) {
     return false;
@@ -643,17 +654,19 @@ rememberButton.addEventListener("click", async () => {
   for (let row = 0; row < ROWS; row += 1) {
     const original = gridRowText(state.sourceGrid[row] || []);
     const corrected = gridRowText(current[row] || []);
-    if (original.trim() && corrected.trim() && original !== corrected) {
-      changes.push({ original, corrected });
+    if (corrected.trim() && original !== corrected) {
+      changes.push({ row, original, corrected });
     }
   }
 
   rememberButton.disabled = true;
   setStatus(`Remembering ${changes.length} correction rows`);
   try {
-    for (const change of changes) {
-      await postJson("/api/remember", change);
-    }
+    await postJson("/api/remember-grid", {
+      image: state.imageDataUrl,
+      sourceGrid: state.sourceGrid,
+      grid: current,
+    });
     const learned = await postJson("/api/remember-templates", {
       image: state.imageDataUrl,
       corners: getGridCorners(),
@@ -668,6 +681,22 @@ rememberButton.addEventListener("click", async () => {
   }
 });
 
+saveRequirementsButton.addEventListener("click", async () => {
+  saveRequirementsButton.disabled = true;
+  setStatus("Saving requirements");
+  try {
+    const result = await postJson("/api/requirements", {
+      text: requirementsInput.value,
+    });
+    setStatus(`${result.count} requirements saved`);
+  } catch (error) {
+    setStatus(error.message);
+  } finally {
+    saveRequirementsButton.disabled = false;
+  }
+});
+
 window.addEventListener("resize", fitCanvas);
 renderGridTable();
 fitCanvas();
+loadRequirements();

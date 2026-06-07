@@ -26,7 +26,8 @@ body {
 }
 
 button,
-input {
+input,
+textarea {
   font: inherit;
 }
 
@@ -185,9 +186,36 @@ button:disabled {
   padding: 0 14px 14px;
 }
 
+.requirements-bar {
+  display: grid;
+  grid-template-columns: auto minmax(220px, 1fr) auto;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 14px;
+  border-bottom: 1px solid var(--line);
+}
+
+.requirements-bar label {
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.requirements-bar textarea {
+  width: 100%;
+  min-height: 62px;
+  resize: vertical;
+  border: 1px solid #aebbc2;
+  border-radius: 4px;
+  padding: 7px 9px;
+  font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+  font-size: 12px;
+  line-height: 1.45;
+}
+
 .table-wrap {
   overflow: auto;
-  height: calc(100vh - 130px);
+  height: calc(100vh - 224px);
 }
 
 table {
@@ -266,6 +294,10 @@ td.guard-cell {
 
   .actions {
     flex-wrap: wrap;
+  }
+
+  .requirements-bar {
+    grid-template-columns: 1fr;
   }
 
   button,
