@@ -663,7 +663,6 @@ rememberButton.addEventListener("click", async () => {
   setStatus(`Remembering ${changes.length} correction rows`);
   try {
     await postJson("/api/remember-grid", {
-      image: state.imageDataUrl,
       sourceGrid: state.sourceGrid,
       grid: current,
     });
@@ -673,7 +672,7 @@ rememberButton.addEventListener("click", async () => {
       grid: current,
     });
     state.sourceGrid = current;
-    setStatus(`Corrections remembered, ${learned.learned} character samples learned`);
+    setStatus(`Reusable corrections saved, ${learned.learned} character samples learned`);
   } catch (error) {
     setStatus(error.message);
   } finally {

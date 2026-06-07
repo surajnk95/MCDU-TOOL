@@ -3,7 +3,6 @@ from __future__ import annotations
 import base64
 import csv
 import difflib
-import hashlib
 import io
 import json
 import os
@@ -66,6 +65,42 @@ MCDU_WORD_HINTS = {
     "SEL",
     "FL",
 }
+MCDU_VOCABULARY = {
+    "ACT",
+    "ALT",
+    "ANRU",
+    "CRZ",
+    "DATA",
+    "DES",
+    "ECON",
+    "ENG",
+    "FUEL",
+    "GPS",
+    "INDEX",
+    "IRU",
+    "LEGS",
+    "LRC",
+    "MAX",
+    "NAV",
+    "NM",
+    "OFF",
+    "ON",
+    "OPT",
+    "OUT",
+    "POS",
+    "RADIO",
+    "RECMD",
+    "REF",
+    "RTA",
+    "RTE",
+    "SEL",
+    "SELECT",
+    "SENSOR",
+    "SPD",
+    "STEP",
+    "TO",
+    "TRUE",
+}
 
 
 def find_tesseract() -> str:
@@ -123,11 +158,6 @@ def load_image(data_url: str) -> Image.Image:
         data_url = data_url.split(",", 1)[1]
     raw = base64.b64decode(data_url)
     return ImageOps.exif_transpose(Image.open(io.BytesIO(raw))).convert("RGB")
-
-
-def image_signature(data_url: str) -> str:
-    encoded = data_url.split(",", 1)[1] if "," in data_url else data_url
-    return hashlib.sha256(encoded.encode("ascii", errors="ignore")).hexdigest()[:24]
 
 
 def edge_length(a: dict[str, float], b: dict[str, float]) -> float:
@@ -450,14 +480,51 @@ def normalize_grid_guards(grid: list[list[str]]) -> list[list[str]]:
     return normalized
 
 
-def place_char(grid: list[list[str]], char_box: dict[str, Any], screen_size: tuple[int, int]) -> bool:
+def calibrate_axis(centers: list[float], nominal_pitch: float, count: int) -> tuple[float, float]:
+    if len(centers) < 6:
+        return 0.0, nominal_pitch
+    values = np.asarray(centers, dtype=np.float32)
+    best = (float("inf"), 0.0, nominal_pitch)
+    for scale in np.linspace(0.985, 1.015, 13):
+        pitch = nominal_pitch * float(scale)
+        indexes = np.clip(np.round(values / pitch - 0.5), 0, count - 1)
+        offsets = values - (indexes + 0.5) * pitch
+        origin = max(-nominal_pitch * 0.16, min(nominal_pitch * 0.16, float(np.median(offsets))))
+        indexes = np.clip(np.round((values - origin) / pitch - 0.5), 0, count - 1)
+        residuals = np.abs(values - (origin + (indexes + 0.5) * pitch))
+        score = float(np.median(residuals)) + abs(origin) * 0.35 + abs(scale - 1.0) * nominal_pitch
+        if score < best[0]:
+            best = (score, origin, pitch)
+    return best[1], best[2]
+
+
+def calibrate_grid(
+    char_boxes: list[dict[str, Any]],
+    screen_size: tuple[int, int],
+) -> dict[str, float]:
+    screen_w, screen_h = screen_size
+    x_centers = [
+        float(box["left"]) + float(box["width"]) * 0.5
+        for box in char_boxes
+        if 2 <= float(box.get("width") or 0) <= screen_w / COLS * 2.1
+    ]
+    y_centers = [
+        float(box["top"]) + float(box["height"]) * 0.5
+        for box in char_boxes
+        if 2 <= float(box.get("height") or 0) <= screen_h / ROWS * 1.4
+    ]
+    origin_x, cell_w = calibrate_axis(x_centers, screen_w / COLS, COLS)
+    origin_y, cell_h = calibrate_axis(y_centers, screen_h / ROWS, ROWS)
+    return {"origin_x": origin_x, "origin_y": origin_y, "cell_w": cell_w, "cell_h": cell_h}
+
+
+def place_char(grid: list[list[str]], char_box: dict[str, Any], geometry: dict[str, float]) -> bool:
     text = clean_ocr_text(str(char_box["text"]))[:1]
     if not text:
         return False
 
-    screen_w, screen_h = screen_size
-    cell_w = screen_w / COLS
-    cell_h = screen_h / ROWS
+    cell_w = geometry["cell_w"]
+    cell_h = geometry["cell_h"]
     box_w = float(char_box.get("width") or 0)
     box_h = float(char_box.get("height") or 0)
     if box_w > cell_w * 2.15 or box_h > cell_h * 1.35 or box_w < 2 or box_h < 2:
@@ -465,8 +532,8 @@ def place_char(grid: list[list[str]], char_box: dict[str, Any], screen_size: tup
 
     center_x = float(char_box["left"]) + box_w * 0.5
     center_y = float(char_box["top"]) + box_h * 0.5
-    row = max(0, min(ROWS - 1, int(center_y / cell_h)))
-    col = clamp_data_col(int(center_x / cell_w))
+    row = max(0, min(ROWS - 1, int((center_y - geometry["origin_y"]) / cell_h)))
+    col = clamp_data_col(int((center_x - geometry["origin_x"]) / cell_w))
 
     if grid[row][col] and grid[row][col] != text:
         for offset in (-1, 1, -2, 2):
@@ -484,17 +551,22 @@ def place_word(
     grid: list[list[str]],
     scores: list[list[float]],
     word: dict[str, Any],
-    screen_size: tuple[int, int],
+    geometry: dict[str, float],
 ) -> None:
     text = clean_ocr_text(str(word["text"]))
     if not text:
         return
 
-    screen_w, screen_h = screen_size
-    cell_w = screen_w / COLS
-    cell_h = screen_h / ROWS
-    row = max(0, min(ROWS - 1, int((word["top"] + word["height"] * 0.5) / cell_h)))
-    start_col = nearest_data_col(float(word["left"]), cell_w)
+    cell_w = geometry["cell_w"]
+    cell_h = geometry["cell_h"]
+    row = max(
+        0,
+        min(
+            ROWS - 1,
+            int((word["top"] + word["height"] * 0.5 - geometry["origin_y"]) / cell_h),
+        ),
+    )
+    start_col = clamp_data_col(int(round((float(word["left"]) - geometry["origin_x"]) / cell_w)))
 
     compact = text.replace(" ", "")
     if not compact:
@@ -508,7 +580,7 @@ def place_word(
     for index, char in enumerate(compact[:max_len]):
         if use_projected_spacing:
             center_x = float(word["left"]) + float(word["width"]) * ((index + 0.5) / len(compact))
-            col = clamp_data_col(int(center_x / cell_w))
+            col = clamp_data_col(int((center_x - geometry["origin_x"]) / cell_w))
         else:
             col = start_col + index
         if not grid[row][col] or quality > scores[row][col] + 10:
@@ -563,6 +635,37 @@ def connected_components(mask: np.ndarray) -> list[dict[str, Any]]:
     return components
 
 
+def robust_line_fit(independent: np.ndarray, dependent: np.ndarray) -> tuple[float, float] | None:
+    if independent.size < 12 or dependent.size != independent.size:
+        return None
+    keep = np.ones(independent.size, dtype=bool)
+    slope = 0.0
+    intercept = float(np.median(dependent))
+    for _ in range(3):
+        if int(np.sum(keep)) < 8:
+            return None
+        slope, intercept = np.polyfit(independent[keep], dependent[keep], 1)
+        residuals = np.abs(dependent - (slope * independent + intercept))
+        cutoff = max(1.5, float(np.percentile(residuals[keep], 72)))
+        keep = residuals <= cutoff
+    return float(slope), float(intercept)
+
+
+def intersect_edge_lines(
+    vertical: tuple[float, float],
+    horizontal: tuple[float, float],
+) -> tuple[float, float] | None:
+    # vertical: x = a*y + b; horizontal: y = c*x + d
+    a, b = vertical
+    c, d = horizontal
+    denominator = 1.0 - a * c
+    if abs(denominator) < 1e-6:
+        return None
+    x = (a * d + b) / denominator
+    y = c * x + d
+    return float(x), float(y)
+
+
 def component_corners(component: dict[str, Any], scale: float) -> list[dict[str, float]]:
     x1 = float(component["x1"])
     y1 = float(component["y1"])
@@ -571,26 +674,79 @@ def component_corners(component: dict[str, Any], scale: float) -> list[dict[str,
     fallback = [(x1, y1), (x2, y1), (x2, y2), (x1, y2)]
     xs = np.asarray(component.get("xs") or [], dtype=np.float32)
     ys = np.asarray(component.get("ys") or [], dtype=np.float32)
-    if xs.size < 4 or ys.size < 4:
+    inside = (xs >= x1) & (xs <= x2) & (ys >= y1) & (ys <= y2)
+    xs = xs[inside]
+    ys = ys[inside]
+    if xs.size < 100 or ys.size < 100:
         points = fallback
     else:
-        sums = xs + ys
-        diffs = xs - ys
-        points = [
-            (float(xs[int(np.argmin(sums))]), float(ys[int(np.argmin(sums))])),
-            (float(xs[int(np.argmax(diffs))]), float(ys[int(np.argmax(diffs))])),
-            (float(xs[int(np.argmax(sums))]), float(ys[int(np.argmax(sums))])),
-            (float(xs[int(np.argmin(diffs))]), float(ys[int(np.argmin(diffs))])),
-        ]
         width = max(1.0, x2 - x1)
         height = max(1.0, y2 - y1)
-        expected = fallback
-        max_corner_error = max(
-            max(abs(px - ex) / width, abs(py - ey) / height)
-            for (px, py), (ex, ey) in zip(points, expected)
+        unique_y = np.unique(ys.astype(np.int32))
+        left_x: list[float] = []
+        right_x: list[float] = []
+        edge_y: list[float] = []
+        for y in unique_y:
+            row_x = xs[ys.astype(np.int32) == y]
+            if row_x.size < 4:
+                continue
+            edge_y.append(float(y))
+            left_x.append(float(np.percentile(row_x, 2)))
+            right_x.append(float(np.percentile(row_x, 98)))
+
+        unique_x = np.unique(xs.astype(np.int32))
+        top_y: list[float] = []
+        bottom_y: list[float] = []
+        edge_x: list[float] = []
+        for x in unique_x:
+            col_y = ys[xs.astype(np.int32) == x]
+            if col_y.size < 4:
+                continue
+            edge_x.append(float(x))
+            top_y.append(float(np.percentile(col_y, 2)))
+            bottom_y.append(float(np.percentile(col_y, 98)))
+
+        edge_y_arr = np.asarray(edge_y, dtype=np.float32)
+        edge_x_arr = np.asarray(edge_x, dtype=np.float32)
+        left_line = robust_line_fit(edge_y_arr, np.asarray(left_x, dtype=np.float32))
+        right_line = robust_line_fit(edge_y_arr, np.asarray(right_x, dtype=np.float32))
+        top_line = robust_line_fit(edge_x_arr, np.asarray(top_y, dtype=np.float32))
+        bottom_line = robust_line_fit(edge_x_arr, np.asarray(bottom_y, dtype=np.float32))
+        intersections = (
+            [
+                intersect_edge_lines(left_line, top_line),
+                intersect_edge_lines(right_line, top_line),
+                intersect_edge_lines(right_line, bottom_line),
+                intersect_edge_lines(left_line, bottom_line),
+            ]
+            if left_line and right_line and top_line and bottom_line
+            else []
         )
-        if max_corner_error > 0.10:
+        if not intersections or any(point is None for point in intersections):
             points = fallback
+        else:
+            points = [point for point in intersections if point is not None]
+            margin_x = width * 0.12
+            margin_y = height * 0.12
+            corner_shift = max(
+                max(abs(px - ex) / width, abs(py - ey) / height)
+                for (px, py), (ex, ey) in zip(points, fallback)
+            )
+            if corner_shift > 0.20 or any(
+                px < x1 - margin_x or px > x2 + margin_x or py < y1 - margin_y or py > y2 + margin_y
+                for px, py in points
+            ):
+                points = fallback
+            else:
+                polygon_area = 0.5 * abs(
+                    sum(
+                        points[index][0] * points[(index + 1) % 4][1]
+                        - points[(index + 1) % 4][0] * points[index][1]
+                        for index in range(4)
+                    )
+                )
+                if polygon_area < width * height * 0.62:
+                    points = fallback
 
     inv = 1 / scale
     return [{"x": x * inv, "y": y * inv} for x, y in points]
@@ -761,7 +917,7 @@ def correction_key(row: int, original: str) -> str:
     return f"row:{row + 1}|{fixed_row_text(original)}"
 
 
-def apply_corrections(grid: list[list[str]], image_id: str = "") -> list[list[str]]:
+def apply_corrections(grid: list[list[str]]) -> list[list[str]]:
     corrections = load_corrections()
     updated = [[cell for cell in row] for row in grid]
     legacy_corrections = {
@@ -773,11 +929,6 @@ def apply_corrections(grid: list[list[str]], image_id: str = "") -> list[list[st
         compact_row_text(key): value for key, value in legacy_corrections.items() if compact_row_text(key)
     }
     for row_index, row in enumerate(updated):
-        image_key = f"image:{image_id}|row:{row_index + 1}"
-        if image_id and image_key in corrections:
-            updated[row_index] = list(fixed_row_text(corrections[image_key]))
-            continue
-
         row_text = fixed_row_text("".join(cell or " " for cell in row))
         exact_key = correction_key(row_index, row_text)
         if exact_key in corrections:
@@ -853,9 +1004,62 @@ def apply_templates(grid: list[list[str]], warped: Image.Image) -> list[list[str
             if col < FIRST_DATA_COL or col > LAST_DATA_COL:
                 continue
             classified = classify_from_templates(cell_feature(warped, row, col), templates)
-            if classified and not updated[row][col]:
-                updated[row][col] = classified[0]
+            if not classified:
+                continue
+            char, distance = classified
+            current = updated[row][col]
+            if not current or (current in {"O", "0"} and char in {"O", "0"}) or distance <= 0.14:
+                updated[row][col] = char
     return updated
+
+
+def normalize_o_zero_token(token: str) -> str:
+    if not token or not any(char in token for char in "O0"):
+        return token
+
+    letters_only = re.sub(r"[^A-Z0]", "", token.upper())
+    as_word = letters_only.replace("0", "O")
+    if as_word in MCDU_VOCABULARY:
+        return token.replace("0", "O")
+
+    if re.fullmatch(r"FL[O0-9]{2,3}", token):
+        return "FL" + token[2:].replace("O", "0")
+
+    result = list(token)
+    digit_count = sum(value.isdigit() for value in token)
+    letter_count = sum(value.isalpha() for value in token)
+    for index, char in enumerate(result):
+        if char not in {"O", "0"}:
+            continue
+        left = result[index - 1] if index > 0 else ""
+        right = result[index + 1] if index + 1 < len(result) else ""
+        numeric_context = (
+            left.isdigit()
+            or right.isdigit()
+            or (digit_count > 0 and any(mark in token for mark in (".", "/", "°")))
+            or digit_count > letter_count
+        )
+        result[index] = "0" if numeric_context else "O"
+    return "".join(result)
+
+
+def disambiguate_o_zero(grid: list[list[str]]) -> list[list[str]]:
+    updated = [[cell for cell in row] for row in grid]
+    for row in range(ROWS):
+        col = FIRST_DATA_COL
+        while col <= LAST_DATA_COL:
+            if not updated[row][col]:
+                col += 1
+                continue
+            start = col
+            chars: list[str] = []
+            while col <= LAST_DATA_COL and updated[row][col]:
+                chars.append(updated[row][col])
+                col += 1
+            normalized = normalize_o_zero_token("".join(chars))
+            for offset, char in enumerate(normalized):
+                updated[row][start + offset] = char
+    return normalize_grid_guards(updated)
 
 
 def grid_character_count(grid: list[list[str]]) -> int:
@@ -865,12 +1069,12 @@ def grid_character_count(grid: list[list[str]]) -> int:
 def verify_grid_with_char_boxes(
     word_grid: list[list[str]],
     char_boxes: list[dict[str, Any]],
-    screen_size: tuple[int, int],
+    geometry: dict[str, float],
 ) -> list[list[str]]:
     verified = [[cell for cell in row] for row in word_grid]
     char_grid = empty_grid()
     for box in char_boxes:
-        place_char(char_grid, box, screen_size)
+        place_char(char_grid, box, geometry)
 
     for row in range(ROWS):
         for col in range(FIRST_DATA_COL, LAST_DATA_COL + 1):
@@ -977,17 +1181,19 @@ def analyze(payload: dict[str, Any]) -> dict[str, Any]:
     screen_size = warped.size
     boxes = run_tesseract_boxes(processed)
     words = run_tesseract_tsv(processed)
+    geometry = calibrate_grid(boxes, screen_size)
 
     grid = empty_grid()
     word_scores = [[0.0 for _ in range(COLS)] for _ in range(ROWS)]
     for word in words:
-        place_word(grid, word_scores, word, screen_size)
+        place_word(grid, word_scores, word, geometry)
     if grid_character_count(grid) < 8:
         for box in boxes:
-            place_char(grid, box, screen_size)
+            place_char(grid, box, geometry)
     grid = recover_dash_lines(grid, warped)
     grid = apply_templates(grid, warped)
-    grid = apply_corrections(grid, image_signature(str(payload["image"])))
+    grid = disambiguate_o_zero(grid)
+    grid = apply_corrections(grid)
     corrected_grid = apply_requirements(grid)
 
     preview_id = f"{uuid.uuid4().hex}.png"
@@ -998,6 +1204,7 @@ def analyze(payload: dict[str, Any]) -> dict[str, Any]:
         "grid": corrected_grid,
         "words": words,
         "boxes": boxes,
+        "calibration": geometry,
         "previewUrl": f"/data/exports/{preview_id}",
     }
 
@@ -1069,16 +1276,13 @@ def remember(payload: dict[str, Any]) -> dict[str, Any]:
 
 
 def remember_grid(payload: dict[str, Any]) -> dict[str, Any]:
-    image_data = str(payload.get("image", ""))
     source_grid = payload.get("sourceGrid")
     corrected_grid = payload.get("grid")
-    if not image_data:
-        raise ValueError("An image is required to remember its corrected grid.")
     if not isinstance(source_grid, list) or not isinstance(corrected_grid, list):
         raise ValueError("Source and corrected 13-row grids are required.")
 
-    signature = image_signature(image_data)
     corrections = load_corrections()
+    corrections = {key: value for key, value in corrections.items() if not key.startswith("image:")}
     saved = 0
     for row in range(ROWS):
         original = grid_row_from_payload(source_grid, row)
@@ -1087,7 +1291,6 @@ def remember_grid(payload: dict[str, Any]) -> dict[str, Any]:
             continue
         if corrected.strip():
             corrections[correction_key(row, original)] = corrected
-        corrections[f"image:{signature}|row:{row + 1}"] = corrected
         saved += 1
     save_corrections(corrections)
     return {"count": len(corrections), "saved": saved}
