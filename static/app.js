@@ -16,8 +16,16 @@ const detectButton = document.querySelector("#detectButton");
 const photoViewButton = document.querySelector("#photoViewButton");
 const flatViewButton = document.querySelector("#flatViewButton");
 const gridTable = document.querySelector("#gridTable");
-const requirementsInput = document.querySelector("#requirementsInput");
+const requirementRow = document.querySelector("#requirementRow");
+const requirementStart = document.querySelector("#requirementStart");
+const requirementEnd = document.querySelector("#requirementEnd");
+const requirementType = document.querySelector("#requirementType");
+const requirementText = document.querySelector("#requirementText");
+const requirementIgnoreCase = document.querySelector("#requirementIgnoreCase");
+const requirementIgnoreSpaces = document.querySelector("#requirementIgnoreSpaces");
+const addRequirementButton = document.querySelector("#addRequirementButton");
 const reviewRequirementsButton = document.querySelector("#reviewRequirementsButton");
+const requirementList = document.querySelector("#requirementList");
 const requirementsSummary = document.querySelector("#requirementsSummary");
 const requirementsResults = document.querySelector("#requirementsResults");
 
@@ -39,6 +47,7 @@ const state = {
   dragging: -1,
   viewMode: "photo",
   sourceGrid: makeEmptyGrid(),
+  requirements: [],
 };
 
 function setStatus(message) {
@@ -673,17 +682,69 @@ rememberButton.addEventListener("click", async () => {
   }
 });
 
+function requirementDescription(requirement) {
+  const typeLabels = {
+    exact: "equals",
+    contains: "contains",
+    fill: "is filled with",
+    blank: "is blank",
+    not_contains: "does not contain",
+  };
+  const value = requirement.type === "blank" ? "" : ` "${requirement.expected}"`;
+  return `Row ${requirement.row}, columns ${requirement.start}-${requirement.end} ${typeLabels[requirement.type]}${value}`;
+}
+
+function renderRequirementList() {
+  requirementList.textContent = "";
+  state.requirements.forEach((requirement, index) => {
+    const item = document.createElement("div");
+    item.className = "requirement-item";
+    const text = document.createElement("span");
+    text.textContent = requirementDescription(requirement);
+    const remove = document.createElement("button");
+    remove.type = "button";
+    remove.textContent = "Remove";
+    remove.dataset.requirementIndex = String(index);
+    item.append(text, remove);
+    requirementList.appendChild(item);
+  });
+  reviewRequirementsButton.disabled = state.requirements.length === 0;
+}
+
+function syncRequirementFields() {
+  const type = requirementType.value;
+  const needsText = type !== "blank";
+  requirementText.disabled = !needsText;
+  if (!needsText) {
+    requirementText.value = "";
+  }
+  if (type === "fill") {
+    requirementText.maxLength = 1;
+  } else {
+    requirementText.removeAttribute("maxlength");
+  }
+}
+
+function autoSetRequirementEnd() {
+  if (requirementType.value !== "exact") {
+    return;
+  }
+  const start = Number(requirementStart.value);
+  const length = Math.max(1, requirementText.value.length);
+  requirementEnd.value = String(Math.min(38, start + length - 1));
+}
+
 function renderRequirementResults(result) {
   const summary = result.summary || {};
   requirementsSummary.hidden = false;
-  requirementsSummary.textContent = `${summary.passed || 0} passed, ${summary.failed || 0} failed, ${summary.needsReview || 0} need review`;
+  requirementsSummary.textContent = `${summary.passed || 0} passed, ${summary.failed || 0} failed, ${summary.needsReview || 0} need confirmation`;
   requirementsResults.hidden = false;
   requirementsResults.textContent = "";
 
   const table = document.createElement("table");
   table.className = "review-table";
   const header = document.createElement("tr");
-  ["Status", "Requirement", "Expected", "Observed", "Location"].forEach((label) => {
+  ["Status", "Requirement", "Expected", "Grid reading", "Focused recheck", "Location", "Reason"].forEach((label) => {
     const th = document.createElement("th");
     th.textContent = label;
     header.appendChild(th);
@@ -696,7 +757,15 @@ function renderRequirementResults(result) {
   (result.results || []).forEach((item) => {
     const tr = document.createElement("tr");
     tr.className = `review-${String(item.status).toLowerCase().replaceAll(" ", "-")}`;
-    [item.status, item.requirement, item.expected, item.observed, item.location].forEach((value) => {
+    [
+      item.status,
+      item.requirement,
+      item.expected,
+      item.observed,
+      item.rechecked || "",
+      item.location,
+      item.detail,
+    ].forEach((value) => {
       const td = document.createElement("td");
       td.textContent = value || "";
       tr.appendChild(td);
@@ -707,13 +776,62 @@ function renderRequirementResults(result) {
   requirementsResults.appendChild(table);
 }
 
+addRequirementButton.addEventListener("click", () => {
+  const row = Number(requirementRow.value);
+  const start = Number(requirementStart.value);
+  const end = Number(requirementEnd.value);
+  const type = requirementType.value;
+  const expected = requirementText.value;
+  if (!Number.isInteger(row) || row < 1 || row > 13 || start < 1 || end < start || end > 38) {
+    setStatus("Enter row 1-13 and a valid column range 1-38");
+    return;
+  }
+  if (type !== "blank" && !expected) {
+    setStatus("Enter the expected text or character");
+    return;
+  }
+  if (type === "fill" && expected.length !== 1) {
+    setStatus("Fill range requires exactly one character");
+    return;
+  }
+  state.requirements.push({
+    row,
+    start,
+    end,
+    type,
+    expected,
+    ignoreCase: requirementIgnoreCase.checked,
+    ignoreSpaces: requirementIgnoreSpaces.checked,
+  });
+  renderRequirementList();
+  setStatus(`${state.requirements.length} requirement${state.requirements.length === 1 ? "" : "s"} ready`);
+});
+
+requirementList.addEventListener("click", (event) => {
+  const button = event.target.closest("button[data-requirement-index]");
+  if (!button) {
+    return;
+  }
+  state.requirements.splice(Number(button.dataset.requirementIndex), 1);
+  renderRequirementList();
+});
+
+requirementType.addEventListener("change", () => {
+  syncRequirementFields();
+  autoSetRequirementEnd();
+});
+requirementStart.addEventListener("input", autoSetRequirementEnd);
+requirementText.addEventListener("input", autoSetRequirementEnd);
+
 reviewRequirementsButton.addEventListener("click", async () => {
   reviewRequirementsButton.disabled = true;
   setStatus("Reviewing requirements against the grid");
   try {
     const result = await postJson("/api/review-requirements", {
-      text: requirementsInput.value,
+      requirements: state.requirements,
       grid: getCurrentGrid(),
+      image: state.imageDataUrl,
+      corners: state.image ? getGridCorners() : [],
     });
     renderRequirementResults(result);
     setStatus(`${result.summary.passed} passed, ${result.summary.failed} failed`);
@@ -727,3 +845,5 @@ reviewRequirementsButton.addEventListener("click", async () => {
 window.addEventListener("resize", fitCanvas);
 renderGridTable();
 fitCanvas();
+syncRequirementFields();
+renderRequirementList();

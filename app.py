@@ -841,123 +841,177 @@ def normalize_requirement_value(value: str) -> str:
     return re.sub(r"\s+", " ", clean_ocr_text(value)).strip().upper()
 
 
+def requirement_matches(requirement: dict[str, Any], observed: str) -> bool:
+    expected = str(requirement.get("expected", ""))
+    ignore_case = bool(requirement.get("ignoreCase", True))
+    ignore_spaces = bool(requirement.get("ignoreSpaces", False))
+    check_type = str(requirement.get("type", "exact"))
+
+    def normalized(value: str) -> str:
+        value = clean_ocr_text(value)
+        if ignore_spaces:
+            value = re.sub(r"\s+", "", value)
+        if ignore_case:
+            value = value.upper()
+        return value
+
+    actual = normalized(observed)
+    target = normalized(expected)
+    if check_type == "blank":
+        return not actual.strip()
+    if check_type == "contains":
+        return target in actual
+    if check_type == "not_contains":
+        return target not in actual
+    if check_type == "fill":
+        width = int(requirement["end"]) - int(requirement["start"]) + 1
+        return actual == normalized(expected * width)
+    return actual == target
+
+
+def focused_grid_read(
+    warped: Image.Image,
+    row: int,
+    start: int,
+    end: int,
+    expected: str,
+) -> str:
+    cell_w = warped.width / COLS
+    cell_h = warped.height / ROWS
+    x1 = max(0, int(start * cell_w))
+    x2 = min(warped.width, int((end + 1) * cell_w))
+    y1 = max(0, int((row - 1) * cell_h))
+    y2 = min(warped.height, int(row * cell_h))
+    crop = warped.crop((x1, y1, x2, y2))
+    scale = 4
+    enlarged = crop.resize((max(1, crop.width * scale), max(1, crop.height * scale)), Image.Resampling.LANCZOS)
+    processed = preprocess_for_ocr(enlarged)
+    width = end - start + 1
+    focused = [" " for _ in range(width)]
+    focused_cell_w = enlarged.width / max(1, width)
+
+    for box in run_tesseract_boxes(processed):
+        box_w = float(box.get("width") or 0)
+        box_h = float(box.get("height") or 0)
+        if box_w < 2 or box_h < 2 or box_w > focused_cell_w * 2.1:
+            continue
+        center_x = float(box["left"]) + box_w * 0.5
+        index = max(0, min(width - 1, int(center_x / focused_cell_w)))
+        char = clean_ocr_text(str(box.get("text", "")))[:1]
+        if char and focused[index] == " ":
+            focused[index] = char
+
+    if expected == "-":
+        gray = np.asarray(ImageOps.grayscale(crop)).astype(np.float32)
+        for index in range(width):
+            cx1 = int(index * crop.width / width)
+            cx2 = int((index + 1) * crop.width / width)
+            cy1 = int(crop.height * 0.36)
+            cy2 = int(crop.height * 0.68)
+            cell = gray[cy1:cy2, cx1:cx2]
+            if cell.size == 0:
+                continue
+            bright = cell > 170
+            if float(np.max(np.mean(bright, axis=1))) >= 0.30:
+                focused[index] = "-"
+
+    cell_reading = "".join(focused)
+    try:
+        words = run_tesseract_tsv(processed)
+    except RuntimeError:
+        words = []
+    raw_reading = " ".join(clean_ocr_text(str(word["text"])) for word in words).strip()
+    if cell_reading.strip():
+        return cell_reading
+    return raw_reading[:width].ljust(width)
+
+
 def review_requirements(payload: dict[str, Any]) -> dict[str, Any]:
-    text = str(payload.get("text", ""))
+    requirements = payload.get("requirements")
     grid = payload.get("grid")
+    if not isinstance(requirements, list) or not requirements:
+        raise ValueError("Add at least one requirement before reviewing.")
     if not isinstance(grid, list) or len(grid) != ROWS:
         raise ValueError("Analyze or enter a 13-row grid before reviewing requirements.")
 
+    warped: Image.Image | None = None
+    image_data = str(payload.get("image", ""))
+    corners = payload.get("corners")
+    if image_data and isinstance(corners, list) and len(corners) == 4:
+        warped = warp_screen(load_image(image_data), corners)
+
     results: list[dict[str, Any]] = []
-    exact_pattern = re.compile(
-        r"^\s*ROW\s+(\d{1,2})\s+(?:COL|COLS|COLUMN|COLUMNS)\s+(\d{1,2})(?:\s*-\s*(\d{1,2}))?\s*(?:=|:|MUST\s+BE|SHALL\s+BE)\s*(.*?)\s*$",
-        re.IGNORECASE,
-    )
-    contains_pattern = re.compile(
-        r"^\s*ROW\s+(\d{1,2})\s+(?:MUST|SHALL|SHOULD)?\s*(?:CONTAINS?|DISPLAYS?|SHOWS?)\s*[:=]?\s*(.*?)\s*$",
-        re.IGNORECASE,
-    )
-
-    for line_number, raw_line in enumerate(text.splitlines(), 1):
-        requirement = raw_line.strip()
-        if not requirement or requirement.startswith("#"):
+    for index, raw_requirement in enumerate(requirements, 1):
+        if not isinstance(raw_requirement, dict):
             continue
-
-        exact = exact_pattern.match(requirement)
-        if exact:
-            row = int(exact.group(1))
-            start = int(exact.group(2))
-            end = int(exact.group(3) or start)
-            expected_raw = exact.group(4).strip().strip('"')
-            if not 1 <= row <= ROWS or not 1 <= start <= end <= 38 or not expected_raw:
-                results.append(
-                    {
-                        "line": line_number,
-                        "requirement": requirement,
-                        "status": "NEEDS REVIEW",
-                        "expected": expected_raw,
-                        "observed": "",
-                        "location": "",
-                        "detail": "Row must be 1-13, columns 1-38, with an expected value.",
-                    }
-                )
-                continue
-            width = end - start + 1
-            expected = expected_raw * width if len(expected_raw) == 1 else expected_raw[:width].ljust(width)
-            observed = grid_row_text(grid, row - 1)[start : end + 1]
-            passed = observed.upper() == expected.upper()
+        try:
+            row = int(raw_requirement["row"])
+            start = int(raw_requirement["start"])
+            end = int(raw_requirement["end"])
+        except (KeyError, TypeError, ValueError):
+            row = start = end = 0
+        check_type = str(raw_requirement.get("type", "exact"))
+        expected_raw = str(raw_requirement.get("expected", ""))
+        valid_type = check_type in {"exact", "contains", "fill", "blank", "not_contains"}
+        valid_expected = check_type == "blank" or bool(expected_raw)
+        valid_fill = check_type != "fill" or len(expected_raw) == 1
+        if not (1 <= row <= ROWS and 1 <= start <= end <= 38 and valid_type and valid_expected and valid_fill):
             results.append(
                 {
-                    "line": line_number,
-                    "requirement": requirement,
-                    "status": "PASS" if passed else "FAIL",
-                    "expected": expected,
-                    "observed": observed,
-                    "location": f"Row {row}, columns {start}-{end}",
-                    "detail": "Exact grid comparison.",
-                }
-            )
-            continue
-
-        contains = contains_pattern.match(requirement)
-        if contains:
-            row = int(contains.group(1))
-            expected = contains.group(2).strip().strip('"')
-            if not 1 <= row <= ROWS or not expected:
-                status = "NEEDS REVIEW"
-                observed = ""
-            else:
-                observed = grid_row_text(grid, row - 1)[FIRST_DATA_COL : LAST_DATA_COL + 1]
-                status = (
-                    "PASS"
-                    if normalize_requirement_value(expected) in normalize_requirement_value(observed)
-                    else "FAIL"
-                )
-            results.append(
-                {
-                    "line": line_number,
-                    "requirement": requirement,
-                    "status": status,
-                    "expected": expected,
-                    "observed": observed,
-                    "location": f"Row {row}" if 1 <= row <= ROWS else "",
-                    "detail": "Row text comparison." if status != "NEEDS REVIEW" else "Could not parse this row requirement.",
-                }
-            )
-            continue
-
-        quoted = re.findall(r'["“](.+?)["”]', requirement)
-        expected = quoted[-1].strip() if quoted else ""
-        if expected:
-            matches: list[str] = []
-            observed_matches: list[str] = []
-            for row in range(ROWS):
-                observed = grid_row_text(grid, row)[FIRST_DATA_COL : LAST_DATA_COL + 1]
-                if normalize_requirement_value(expected) in normalize_requirement_value(observed):
-                    matches.append(f"Row {row + 1}")
-                    observed_matches.append(f"Row {row + 1}: {observed.rstrip()}")
-            results.append(
-                {
-                    "line": line_number,
-                    "requirement": requirement,
-                    "status": "PASS" if matches else "FAIL",
-                    "expected": expected,
-                    "observed": "\n".join(observed_matches) if matches else "Not found in extracted grid",
-                    "location": ", ".join(matches),
-                    "detail": "Quoted text searched across all rows.",
-                }
-            )
-        else:
-            results.append(
-                {
-                    "line": line_number,
-                    "requirement": requirement,
+                    "line": index,
+                    "requirement": "Invalid requirement",
                     "status": "NEEDS REVIEW",
-                    "expected": "",
+                    "expected": expected_raw,
                     "observed": "",
+                    "rechecked": "",
                     "location": "",
-                    "detail": 'Use row/column wording or quote the exact display text, for example "NAV DATA".',
+                    "detail": "Check the row, column range, check type, and expected text.",
                 }
             )
+            continue
+
+        requirement = dict(raw_requirement)
+        width = end - start + 1
+        expected_display = (
+            expected_raw * width
+            if check_type == "fill"
+            else "Blank"
+            if check_type == "blank"
+            else expected_raw
+        )
+        observed = grid_row_text(grid, row - 1)[start : end + 1]
+        passed = requirement_matches(requirement, observed)
+        rechecked = ""
+        detail = "Matched the extracted grid." if passed else "Initial grid reading did not match."
+
+        if not passed and warped is not None:
+            rechecked = focused_grid_read(warped, row, start, end, expected_raw)
+            passed = requirement_matches(requirement, rechecked)
+            detail = (
+                "Passed after focused OCR recheck; confirm the focused reading."
+                if passed
+                else "Focused OCR recheck also did not match."
+            )
+
+        type_label = {
+            "exact": "Exact text",
+            "contains": "Contains text",
+            "fill": "Fill range",
+            "blank": "Blank range",
+            "not_contains": "Must not contain",
+        }[check_type]
+        results.append(
+            {
+                "line": index,
+                "requirement": type_label,
+                "status": "PASS" if passed else "FAIL",
+                "expected": expected_display,
+                "observed": observed,
+                "rechecked": rechecked,
+                "location": f"Row {row}, columns {start}-{end}",
+                "detail": detail,
+            }
+        )
 
     summary = {
         "total": len(results),

@@ -27,7 +27,8 @@ body {
 
 button,
 input,
-textarea {
+textarea,
+select {
   font: inherit;
 }
 
@@ -187,31 +188,93 @@ button:disabled {
   padding: 0 14px 14px;
 }
 
-.requirements-bar {
+.requirement-builder {
   display: grid;
-  grid-template-columns: auto minmax(220px, 1fr) auto;
-  align-items: center;
+  grid-template-columns: repeat(4, minmax(86px, 1fr));
+  align-items: end;
   gap: 10px;
-  padding: 10px 14px;
+  padding: 12px 14px;
   border-bottom: 1px solid var(--line);
+  background: #f8fafb;
 }
 
-.requirements-bar label {
+.requirement-builder label {
+  display: grid;
+  gap: 5px;
   color: var(--muted);
   font-size: 12px;
   font-weight: 700;
 }
 
-.requirements-bar textarea {
+.requirement-builder input[type="number"],
+.requirement-builder input[type="text"],
+.requirement-builder select {
   width: 100%;
-  min-height: 62px;
-  resize: vertical;
+  min-width: 0;
+  height: 34px;
   border: 1px solid #aebbc2;
-  border-radius: 4px;
-  padding: 7px 9px;
-  font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+  border-radius: 6px;
+  background: #ffffff;
+  padding: 0 9px;
+  color: var(--ink);
+}
+
+.requirement-builder .requirement-text-field {
+  grid-column: span 2;
+}
+
+.requirement-builder .toggle-label {
+  display: flex;
+  align-items: center;
+  align-self: center;
+  gap: 7px;
+  min-height: 34px;
+  font-weight: 600;
+}
+
+.requirement-builder .toggle-label input {
+  margin: 0;
+  accent-color: var(--accent);
+}
+
+.requirement-list {
+  display: grid;
+  gap: 6px;
+  max-height: 150px;
+  overflow: auto;
+  padding: 0 14px;
+  border-bottom: 1px solid var(--line);
+}
+
+.requirement-list:empty {
+  display: none;
+}
+
+.requirement-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 7px 0;
+  border-bottom: 1px solid #e3e9ec;
+  color: #314047;
   font-size: 12px;
-  line-height: 1.45;
+}
+
+.requirement-item:last-child {
+  border-bottom: 0;
+}
+
+.requirement-item span {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.requirement-item button {
+  flex: 0 0 auto;
+  min-height: 28px;
+  padding: 0 8px;
+  font-size: 12px;
 }
 
 .requirements-summary {
@@ -231,7 +294,7 @@ button:disabled {
 
 .review-table {
   width: 100%;
-  min-width: 720px;
+  min-width: 980px;
   table-layout: auto;
 }
 
@@ -243,6 +306,7 @@ button:disabled {
   padding: 7px 8px;
   text-align: left;
   white-space: pre-wrap;
+  vertical-align: top;
 }
 
 .review-table th:first-child,
@@ -250,6 +314,13 @@ button:disabled {
   position: static;
   width: 105px;
   min-width: 105px;
+}
+
+.review-table td:nth-child(3),
+.review-table td:nth-child(4),
+.review-table td:nth-child(5) {
+  font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+  white-space: pre;
 }
 
 .review-pass td:first-child {
@@ -332,12 +403,8 @@ td.guard-cell {
     flex: 1 1 110px;
   }
 
-  .requirements-bar {
-    grid-template-columns: minmax(0, 1fr) auto;
-  }
-
-  .requirements-bar label {
-    grid-column: 1 / -1;
+  .requirement-builder {
+    grid-template-columns: repeat(2, minmax(110px, 1fr));
   }
 }
 
@@ -365,8 +432,12 @@ td.guard-cell {
     flex-wrap: wrap;
   }
 
-  .requirements-bar {
+  .requirement-builder {
     grid-template-columns: 1fr;
+  }
+
+  .requirement-builder .requirement-text-field {
+    grid-column: auto;
   }
 
   button,

@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>777-9 MCDU Grid Tool</title>
-    <link rel="stylesheet" href="/styles.css?v=requirement-review" />
+    <link rel="stylesheet" href="/styles.css?v=requirement-builder-2" />
   </head>
   <body>
     <header class="topbar">
@@ -64,16 +64,45 @@
           <h2>Extracted Grid</h2>
           <button id="rememberButton" type="button" disabled>Remember Corrections</button>
         </div>
-        <div class="requirements-bar">
-          <label for="requirementsInput">Requirement Review</label>
-          <textarea
-            id="requirementsInput"
-            rows="4"
-            spellcheck="false"
-            placeholder='Paste requirements here. Example: ROW 11 COL 1-38 = -'
-          ></textarea>
-          <button id="reviewRequirementsButton" type="button">Review Requirements</button>
+        <div class="requirement-builder">
+          <label>
+            Row
+            <input id="requirementRow" type="number" min="1" max="13" value="1" />
+          </label>
+          <label>
+            Start column
+            <input id="requirementStart" type="number" min="1" max="38" value="1" />
+          </label>
+          <label>
+            End column
+            <input id="requirementEnd" type="number" min="1" max="38" value="1" />
+          </label>
+          <label>
+            Check
+            <select id="requirementType">
+              <option value="exact">Exact text</option>
+              <option value="contains">Contains text</option>
+              <option value="fill">Fill range with character</option>
+              <option value="blank">Range must be blank</option>
+              <option value="not_contains">Must not contain text</option>
+            </select>
+          </label>
+          <label class="requirement-text-field">
+            Expected text
+            <input id="requirementText" type="text" autocomplete="off" />
+          </label>
+          <label class="toggle-label">
+            <input id="requirementIgnoreCase" type="checkbox" checked />
+            Ignore case
+          </label>
+          <label class="toggle-label">
+            <input id="requirementIgnoreSpaces" type="checkbox" />
+            Ignore extra spaces
+          </label>
+          <button id="addRequirementButton" type="button">Add Requirement</button>
+          <button id="reviewRequirementsButton" class="primary" type="button" disabled>Review All</button>
         </div>
+        <div id="requirementList" class="requirement-list"></div>
         <div id="requirementsSummary" class="requirements-summary" hidden></div>
         <div id="requirementsResults" class="requirements-results" hidden></div>
         <div class="table-wrap">
@@ -82,6 +111,6 @@
       </section>
     </main>
 
-    <script src="/app.js?v=requirement-review"></script>
+    <script src="/app.js?v=requirement-builder-2"></script>
   </body>
 </html>
