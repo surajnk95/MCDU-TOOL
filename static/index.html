@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>777-9 MCDU Grid Tool</title>
-    <link rel="stylesheet" href="/styles.css" />
+    <link rel="stylesheet" href="/styles.css?v=requirement-review" />
   </head>
   <body>
     <header class="topbar">
@@ -65,21 +65,23 @@
           <button id="rememberButton" type="button" disabled>Remember Corrections</button>
         </div>
         <div class="requirements-bar">
-          <label for="requirementsInput">Requirements</label>
+          <label for="requirementsInput">Requirement Review</label>
           <textarea
             id="requirementsInput"
-            rows="3"
+            rows="4"
             spellcheck="false"
-            placeholder="ROW 11 COL 1-38 = -"
+            placeholder='Paste requirements here. Example: ROW 11 COL 1-38 = -'
           ></textarea>
-          <button id="saveRequirementsButton" type="button">Save Requirements</button>
+          <button id="reviewRequirementsButton" type="button">Review Requirements</button>
         </div>
+        <div id="requirementsSummary" class="requirements-summary" hidden></div>
+        <div id="requirementsResults" class="requirements-results" hidden></div>
         <div class="table-wrap">
           <table id="gridTable" aria-label="MCDU extracted 13 by 40 grid"></table>
         </div>
       </section>
     </main>
 
-    <script src="/app.js"></script>
+    <script src="/app.js?v=requirement-review"></script>
   </body>
 </html>

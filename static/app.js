@@ -17,7 +17,9 @@ const photoViewButton = document.querySelector("#photoViewButton");
 const flatViewButton = document.querySelector("#flatViewButton");
 const gridTable = document.querySelector("#gridTable");
 const requirementsInput = document.querySelector("#requirementsInput");
-const saveRequirementsButton = document.querySelector("#saveRequirementsButton");
+const reviewRequirementsButton = document.querySelector("#reviewRequirementsButton");
+const requirementsSummary = document.querySelector("#requirementsSummary");
+const requirementsResults = document.querySelector("#requirementsResults");
 
 const insetInputs = {
   left: document.querySelector("#leftInset"),
@@ -433,15 +435,6 @@ async function postJson(url, body) {
   return payload;
 }
 
-async function loadRequirements() {
-  try {
-    const result = await postJson("/api/requirements/load", {});
-    requirementsInput.value = result.text || "";
-  } catch (error) {
-    setStatus(error.message);
-  }
-}
-
 async function autoDetectDisplay() {
   if (!state.imageDataUrl) {
     return false;
@@ -680,22 +673,57 @@ rememberButton.addEventListener("click", async () => {
   }
 });
 
-saveRequirementsButton.addEventListener("click", async () => {
-  saveRequirementsButton.disabled = true;
-  setStatus("Saving requirements");
-  try {
-    const result = await postJson("/api/requirements", {
-      text: requirementsInput.value,
+function renderRequirementResults(result) {
+  const summary = result.summary || {};
+  requirementsSummary.hidden = false;
+  requirementsSummary.textContent = `${summary.passed || 0} passed, ${summary.failed || 0} failed, ${summary.needsReview || 0} need review`;
+  requirementsResults.hidden = false;
+  requirementsResults.textContent = "";
+
+  const table = document.createElement("table");
+  table.className = "review-table";
+  const header = document.createElement("tr");
+  ["Status", "Requirement", "Expected", "Observed", "Location"].forEach((label) => {
+    const th = document.createElement("th");
+    th.textContent = label;
+    header.appendChild(th);
+  });
+  const thead = document.createElement("thead");
+  thead.appendChild(header);
+  table.appendChild(thead);
+
+  const tbody = document.createElement("tbody");
+  (result.results || []).forEach((item) => {
+    const tr = document.createElement("tr");
+    tr.className = `review-${String(item.status).toLowerCase().replaceAll(" ", "-")}`;
+    [item.status, item.requirement, item.expected, item.observed, item.location].forEach((value) => {
+      const td = document.createElement("td");
+      td.textContent = value || "";
+      tr.appendChild(td);
     });
-    setStatus(`${result.count} requirements saved`);
+    tbody.appendChild(tr);
+  });
+  table.appendChild(tbody);
+  requirementsResults.appendChild(table);
+}
+
+reviewRequirementsButton.addEventListener("click", async () => {
+  reviewRequirementsButton.disabled = true;
+  setStatus("Reviewing requirements against the grid");
+  try {
+    const result = await postJson("/api/review-requirements", {
+      text: requirementsInput.value,
+      grid: getCurrentGrid(),
+    });
+    renderRequirementResults(result);
+    setStatus(`${result.summary.passed} passed, ${result.summary.failed} failed`);
   } catch (error) {
     setStatus(error.message);
   } finally {
-    saveRequirementsButton.disabled = false;
+    reviewRequirementsButton.disabled = false;
   }
 });
 
 window.addEventListener("resize", fitCanvas);
 renderGridTable();
 fitCanvas();
-loadRequirements();

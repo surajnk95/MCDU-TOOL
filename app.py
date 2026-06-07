@@ -33,7 +33,6 @@ DATA = ROOT / "data"
 EXPORTS = DATA / "exports"
 CORRECTIONS = DATA / "corrections.json"
 TEMPLATES = DATA / "templates.json"
-REQUIREMENTS = DATA / "requirements.json"
 
 ROWS = 13
 COLS = 40
@@ -132,8 +131,6 @@ def ensure_dirs() -> None:
         CORRECTIONS.write_text("{}", encoding="utf-8")
     if not TEMPLATES.exists():
         TEMPLATES.write_text("{}", encoding="utf-8")
-    if not REQUIREMENTS.exists():
-        REQUIREMENTS.write_text('{"text": "", "rules": []}', encoding="utf-8")
 
 
 def json_response(handler: SimpleHTTPRequestHandler, status: int, payload: dict[str, Any]) -> None:
@@ -835,74 +832,140 @@ def save_corrections(corrections: dict[str, str]) -> None:
     CORRECTIONS.write_text(json.dumps(corrections, indent=2, sort_keys=True), encoding="utf-8")
 
 
-def parse_requirements(text: str) -> tuple[list[dict[str, Any]], list[str]]:
-    rules: list[dict[str, Any]] = []
-    errors: list[str] = []
-    pattern = re.compile(
-        r"^\s*ROW\s+(\d{1,2})\s+(?:COL|COLS|COLUMN|COLUMNS)\s+(\d{1,2})(?:\s*-\s*(\d{1,2}))?\s*[:=]\s*(.*?)\s*$",
+def grid_row_text(grid: list[Any], row: int) -> str:
+    values = grid[row] if row < len(grid) and isinstance(grid[row], list) else []
+    return "".join(str(values[col])[:1] if col < len(values) and values[col] else " " for col in range(COLS))
+
+
+def normalize_requirement_value(value: str) -> str:
+    return re.sub(r"\s+", " ", clean_ocr_text(value)).strip().upper()
+
+
+def review_requirements(payload: dict[str, Any]) -> dict[str, Any]:
+    text = str(payload.get("text", ""))
+    grid = payload.get("grid")
+    if not isinstance(grid, list) or len(grid) != ROWS:
+        raise ValueError("Analyze or enter a 13-row grid before reviewing requirements.")
+
+    results: list[dict[str, Any]] = []
+    exact_pattern = re.compile(
+        r"^\s*ROW\s+(\d{1,2})\s+(?:COL|COLS|COLUMN|COLUMNS)\s+(\d{1,2})(?:\s*-\s*(\d{1,2}))?\s*(?:=|:|MUST\s+BE|SHALL\s+BE)\s*(.*?)\s*$",
         re.IGNORECASE,
     )
+    contains_pattern = re.compile(
+        r"^\s*ROW\s+(\d{1,2})\s+(?:MUST|SHALL|SHOULD)?\s*(?:CONTAINS?|DISPLAYS?|SHOWS?)\s*[:=]?\s*(.*?)\s*$",
+        re.IGNORECASE,
+    )
+
     for line_number, raw_line in enumerate(text.splitlines(), 1):
-        line = raw_line.strip()
-        if not line or line.startswith("#"):
+        requirement = raw_line.strip()
+        if not requirement or requirement.startswith("#"):
             continue
-        match = pattern.match(raw_line)
-        if not match:
-            errors.append(f"Line {line_number}: use ROW n COL start-end = text")
-            continue
-        row = int(match.group(1))
-        start = int(match.group(2))
-        end = int(match.group(3) or start)
-        value = match.group(4)
-        if not 1 <= row <= ROWS or not 1 <= start <= end <= 38:
-            errors.append(f"Line {line_number}: row must be 1-13 and columns must be 1-38")
-            continue
-        if not value:
-            errors.append(f"Line {line_number}: requirement text cannot be blank")
-            continue
-        rules.append({"row": row - 1, "start": start, "end": end, "value": value})
-    return rules, errors
 
+        exact = exact_pattern.match(requirement)
+        if exact:
+            row = int(exact.group(1))
+            start = int(exact.group(2))
+            end = int(exact.group(3) or start)
+            expected_raw = exact.group(4).strip().strip('"')
+            if not 1 <= row <= ROWS or not 1 <= start <= end <= 38 or not expected_raw:
+                results.append(
+                    {
+                        "line": line_number,
+                        "requirement": requirement,
+                        "status": "NEEDS REVIEW",
+                        "expected": expected_raw,
+                        "observed": "",
+                        "location": "",
+                        "detail": "Row must be 1-13, columns 1-38, with an expected value.",
+                    }
+                )
+                continue
+            width = end - start + 1
+            expected = expected_raw * width if len(expected_raw) == 1 else expected_raw[:width].ljust(width)
+            observed = grid_row_text(grid, row - 1)[start : end + 1]
+            passed = observed.upper() == expected.upper()
+            results.append(
+                {
+                    "line": line_number,
+                    "requirement": requirement,
+                    "status": "PASS" if passed else "FAIL",
+                    "expected": expected,
+                    "observed": observed,
+                    "location": f"Row {row}, columns {start}-{end}",
+                    "detail": "Exact grid comparison.",
+                }
+            )
+            continue
 
-def load_requirements() -> dict[str, Any]:
-    ensure_dirs()
-    try:
-        data = json.loads(REQUIREMENTS.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, OSError):
-        data = {"text": "", "rules": []}
-    return {
-        "text": str(data.get("text", "")),
-        "rules": data.get("rules", []) if isinstance(data.get("rules"), list) else [],
+        contains = contains_pattern.match(requirement)
+        if contains:
+            row = int(contains.group(1))
+            expected = contains.group(2).strip().strip('"')
+            if not 1 <= row <= ROWS or not expected:
+                status = "NEEDS REVIEW"
+                observed = ""
+            else:
+                observed = grid_row_text(grid, row - 1)[FIRST_DATA_COL : LAST_DATA_COL + 1]
+                status = (
+                    "PASS"
+                    if normalize_requirement_value(expected) in normalize_requirement_value(observed)
+                    else "FAIL"
+                )
+            results.append(
+                {
+                    "line": line_number,
+                    "requirement": requirement,
+                    "status": status,
+                    "expected": expected,
+                    "observed": observed,
+                    "location": f"Row {row}" if 1 <= row <= ROWS else "",
+                    "detail": "Row text comparison." if status != "NEEDS REVIEW" else "Could not parse this row requirement.",
+                }
+            )
+            continue
+
+        quoted = re.findall(r'["“](.+?)["”]', requirement)
+        expected = quoted[-1].strip() if quoted else ""
+        if expected:
+            matches: list[str] = []
+            observed_matches: list[str] = []
+            for row in range(ROWS):
+                observed = grid_row_text(grid, row)[FIRST_DATA_COL : LAST_DATA_COL + 1]
+                if normalize_requirement_value(expected) in normalize_requirement_value(observed):
+                    matches.append(f"Row {row + 1}")
+                    observed_matches.append(f"Row {row + 1}: {observed.rstrip()}")
+            results.append(
+                {
+                    "line": line_number,
+                    "requirement": requirement,
+                    "status": "PASS" if matches else "FAIL",
+                    "expected": expected,
+                    "observed": "\n".join(observed_matches) if matches else "Not found in extracted grid",
+                    "location": ", ".join(matches),
+                    "detail": "Quoted text searched across all rows.",
+                }
+            )
+        else:
+            results.append(
+                {
+                    "line": line_number,
+                    "requirement": requirement,
+                    "status": "NEEDS REVIEW",
+                    "expected": "",
+                    "observed": "",
+                    "location": "",
+                    "detail": 'Use row/column wording or quote the exact display text, for example "NAV DATA".',
+                }
+            )
+
+    summary = {
+        "total": len(results),
+        "passed": sum(result["status"] == "PASS" for result in results),
+        "failed": sum(result["status"] == "FAIL" for result in results),
+        "needsReview": sum(result["status"] == "NEEDS REVIEW" for result in results),
     }
-
-
-def save_requirements(payload: dict[str, Any]) -> dict[str, Any]:
-    text = str(payload.get("text", ""))
-    rules, errors = parse_requirements(text)
-    if errors:
-        raise ValueError(" ".join(errors))
-    data = {"text": text, "rules": rules}
-    REQUIREMENTS.write_text(json.dumps(data, indent=2), encoding="utf-8")
-    return {"text": text, "rules": rules, "count": len(rules)}
-
-
-def apply_requirements(grid: list[list[str]]) -> list[list[str]]:
-    updated = [[cell for cell in row] for row in grid]
-    for rule in load_requirements()["rules"]:
-        try:
-            row = int(rule["row"])
-            start = int(rule["start"])
-            end = int(rule["end"])
-            value = str(rule["value"])
-        except (KeyError, TypeError, ValueError):
-            continue
-        if not 0 <= row < ROWS or not FIRST_DATA_COL <= start <= end <= LAST_DATA_COL:
-            continue
-        width = end - start + 1
-        content = value * width if len(value) == 1 else value.ljust(width)
-        for offset, char in enumerate(content[:width]):
-            updated[row][start + offset] = "" if char == " " else char
-    return normalize_grid_guards(updated)
+    return {"results": results, "summary": summary}
 
 
 def compact_row_text(value: str) -> str:
@@ -1193,8 +1256,7 @@ def analyze(payload: dict[str, Any]) -> dict[str, Any]:
     grid = recover_dash_lines(grid, warped)
     grid = apply_templates(grid, warped)
     grid = disambiguate_o_zero(grid)
-    grid = apply_corrections(grid)
-    corrected_grid = apply_requirements(grid)
+    corrected_grid = apply_corrections(grid)
 
     preview_id = f"{uuid.uuid4().hex}.png"
     preview_path = EXPORTS / preview_id
@@ -1305,6 +1367,12 @@ def grid_row_from_payload(grid: list[Any], row: int) -> str:
 
 
 class McmduHandler(SimpleHTTPRequestHandler):
+    def end_headers(self) -> None:
+        self.send_header("Cache-Control", "no-store, no-cache, must-revalidate")
+        self.send_header("Pragma", "no-cache")
+        self.send_header("Expires", "0")
+        super().end_headers()
+
     def translate_path(self, path: str) -> str:
         parsed = urlparse(path).path
         if parsed.startswith("/data/exports/"):
@@ -1330,10 +1398,8 @@ class McmduHandler(SimpleHTTPRequestHandler):
                 json_response(self, HTTPStatus.OK, remember_grid(payload))
             elif self.path == "/api/remember-templates":
                 json_response(self, HTTPStatus.OK, remember_templates(payload))
-            elif self.path == "/api/requirements":
-                json_response(self, HTTPStatus.OK, save_requirements(payload))
-            elif self.path == "/api/requirements/load":
-                json_response(self, HTTPStatus.OK, load_requirements())
+            elif self.path == "/api/review-requirements":
+                json_response(self, HTTPStatus.OK, review_requirements(payload))
             else:
                 json_response(self, HTTPStatus.NOT_FOUND, {"error": "Unknown endpoint."})
         except Exception as exc:  # noqa: BLE001 - API boundary should return useful errors.
