@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>777-9 MCDU Grid Tool</title>
-    <link rel="stylesheet" href="/styles.css?v=requirement-builder-2" />
+    <link rel="stylesheet" href="/styles.css?v=focused-grid-pass" />
   </head>
   <body>
     <header class="topbar">
@@ -64,6 +64,22 @@
           <h2>Extracted Grid</h2>
           <button id="rememberButton" type="button" disabled>Remember Corrections</button>
         </div>
+        <div class="verification-panel">
+          <label class="toggle-label">
+            <input id="wholeGridVerify" type="checkbox" />
+            Whole-grid focused recheck during analysis
+          </label>
+          <label>
+            Recheck behavior
+            <select id="verificationMode">
+              <option value="conservative">Fill missed cells only</option>
+              <option value="balanced">Fill blanks and trusted dashes</option>
+              <option value="aggressive">Replace with focused reading</option>
+            </select>
+          </label>
+          <button id="refineGridButton" type="button" disabled>Focused Recheck</button>
+          <div id="verificationSummary" class="verification-summary" hidden></div>
+        </div>
         <div class="requirement-builder">
           <label>
             Row
@@ -111,6 +127,6 @@
       </section>
     </main>
 
-    <script src="/app.js?v=requirement-builder-2"></script>
+    <script src="/app.js?v=focused-grid-pass"></script>
   </body>
 </html>

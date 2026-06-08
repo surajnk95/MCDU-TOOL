@@ -100,6 +100,27 @@ MCDU_VOCABULARY = {
     "TO",
     "TRUE",
 }
+MCDU_PHRASE_REPLACEMENTS = (
+    ("ACTRTACRZ", "ACT RTA CRZ"),
+    ("ACTLRCD/D", "ACT LRC D/D"),
+    ("MODLRCD/D", "MOD LRC D/D"),
+    ("RTAPROGRESS", "RTA PROGRESS"),
+    ("DESFORECAST", "DES FORECAST"),
+    ("OFFPATHDES", "OFFPATH DES"),
+    ("ENGOUT", "ENG OUT"),
+    ("ALLENG", "ALL ENG"),
+    ("CRZALT", "CRZ ALT"),
+    ("RTASPD", "RTA SPD"),
+    ("SELSPD", "SEL SPD"),
+    ("RECHD", "RECMD"),
+    ("NAX", "MAX"),
+    ("TA/PUEL", "ETA/FUEL"),
+    ("TA/FUEL", "ETA/FUEL"),
+    ("PUEL", "FUEL"),
+    ("KOFIETA/FUEL", "KBFI ETA/FUEL"),
+    ("ETA/FUEL", "ETA/FUEL"),
+    ("ETAFUEL", "ETA/FUEL"),
+)
 
 
 def find_tesseract() -> str:
@@ -457,6 +478,49 @@ def clean_ocr_text(text: str) -> str:
     return text.strip()
 
 
+def normalize_mcdu_phrase(text: str) -> str:
+    text = clean_ocr_text(text).upper()
+    compact = text.replace(" ", "")
+    suffix = ">" if compact.endswith(">") else ""
+    core = compact[:-1] if suffix else compact
+    for source, replacement in MCDU_PHRASE_REPLACEMENTS:
+        if core == source:
+            return f"{replacement}{suffix}"
+        if source in core and len(core) <= len(source) + 4:
+            return f"{core.replace(source, replacement)}{suffix}"
+    for source, replacement in (("RECHD", "RECMD"), ("NAX", "MAX"), ("PUEL", "FUEL"), ("KOFI", "KBFI")):
+        if source in core:
+            core = core.replace(source, replacement)
+    original_core = compact[:-1] if suffix else compact
+    if core != original_core:
+        return f"{core}{suffix}"
+    return text
+
+
+def mcdu_row_score(text: str) -> float:
+    normalized = normalize_mcdu_phrase(text)
+    compact = normalized.replace(" ", "")
+    score = 0.0
+    for word in MCDU_VOCABULARY:
+        if word in normalized.split() or word in compact:
+            score += 8.0
+    for hint in MCDU_WORD_HINTS:
+        if hint in compact:
+            score += 12.0
+    if re.search(r"\d+/\d+", compact):
+        score += 10.0
+    if re.search(r"FL\d{2,3}", compact):
+        score += 10.0
+    score += compact.count("<") * 4.0 + compact.count(">") * 4.0
+    score += min(len(compact), 20) * 0.4
+    score -= len(re.findall(r"(?<![A-Z0-9])[A-Z0-9](?![A-Z0-9])", normalized)) * 2.5
+    return score
+
+
+def row_string_from_cells(row: list[str]) -> str:
+    return "".join(cell or " " for cell in row[:COLS]).rstrip()
+
+
 def empty_grid() -> list[list[str]]:
     return [["" for _ in range(COLS)] for _ in range(ROWS)]
 
@@ -550,7 +614,7 @@ def place_word(
     word: dict[str, Any],
     geometry: dict[str, float],
 ) -> None:
-    text = clean_ocr_text(str(word["text"]))
+    text = normalize_mcdu_phrase(str(word["text"]))
     if not text:
         return
 
@@ -571,10 +635,13 @@ def place_word(
 
     quality = word_quality(word)
     box_cols = max(1, int(round(float(word.get("width") or 1) / cell_w)))
-    use_projected_spacing = box_cols > len(compact) + 1
+    sequence = text if " " in text and len(text) <= box_cols + 2 else compact
+    use_projected_spacing = " " not in sequence and box_cols > len(compact) + 1
     max_len = LAST_DATA_COL - start_col + 1
 
-    for index, char in enumerate(compact[:max_len]):
+    for index, char in enumerate(sequence[:max_len]):
+        if char.isspace():
+            continue
         if use_projected_spacing:
             center_x = float(word["left"]) + float(word["width"]) * ((index + 0.5) / len(compact))
             col = clamp_data_col(int((center_x - geometry["origin_x"]) / cell_w))
@@ -773,7 +840,7 @@ def detect_display(payload: dict[str, Any]) -> dict[str, Any]:
             or component["x2"] >= small.width - 2
             or component["y2"] >= small.height - 2
         )
-        if area < image_area * 0.08 or aspect < 0.75 or aspect > 3.2:
+        if area < image_area * 0.08 or aspect < 0.9 or aspect > 3.2:
             continue
         score = component["count"] * min(1.0, component["fill"] * 1.4)
         if touches_edge:
@@ -890,16 +957,46 @@ def focused_grid_read(
     focused = [" " for _ in range(width)]
     focused_cell_w = enlarged.width / max(1, width)
 
-    for box in run_tesseract_boxes(processed):
-        box_w = float(box.get("width") or 0)
-        box_h = float(box.get("height") or 0)
-        if box_w < 2 or box_h < 2 or box_w > focused_cell_w * 2.1:
+    try:
+        words = run_tesseract_tsv(processed)
+    except RuntimeError:
+        words = []
+
+    for word in words:
+        text = normalize_mcdu_phrase(str(word.get("text", "")))
+        if not text:
             continue
-        center_x = float(box["left"]) + box_w * 0.5
-        index = max(0, min(width - 1, int(center_x / focused_cell_w)))
-        char = clean_ocr_text(str(box.get("text", "")))[:1]
-        if char and focused[index] == " ":
-            focused[index] = char
+        compact = text.replace(" ", "")
+        if not compact:
+            continue
+        word_left = float(word.get("left") or 0)
+        word_width = float(word.get("width") or 1)
+        start_index = max(0, min(width - 1, int(round(word_left / focused_cell_w))))
+        span_cols = max(1, int(round(word_width / focused_cell_w)))
+        sequence = text if " " in text and len(text) <= span_cols + 2 else compact
+        use_projected_spacing = " " not in sequence and span_cols > len(compact) + 1
+        for index, char in enumerate(sequence):
+            if char.isspace():
+                continue
+            if use_projected_spacing:
+                center_x = word_left + word_width * ((index + 0.5) / max(1, len(compact)))
+                target = max(0, min(width - 1, int(center_x / focused_cell_w)))
+            else:
+                target = start_index + index
+            if 0 <= target < width and focused[target] == " ":
+                focused[target] = char
+
+    if not "".join(focused).strip():
+        for box in run_tesseract_boxes(processed):
+            box_w = float(box.get("width") or 0)
+            box_h = float(box.get("height") or 0)
+            if box_w < 2 or box_h < 2 or box_w > focused_cell_w * 2.1:
+                continue
+            center_x = float(box["left"]) + box_w * 0.5
+            index = max(0, min(width - 1, int(center_x / focused_cell_w)))
+            char = clean_ocr_text(str(box.get("text", "")))[:1]
+            if char and focused[index] == " ":
+                focused[index] = char
 
     if expected == "-":
         gray = np.asarray(ImageOps.grayscale(crop)).astype(np.float32)
@@ -916,14 +1013,110 @@ def focused_grid_read(
                 focused[index] = "-"
 
     cell_reading = "".join(focused)
-    try:
-        words = run_tesseract_tsv(processed)
-    except RuntimeError:
-        words = []
     raw_reading = " ".join(clean_ocr_text(str(word["text"])) for word in words).strip()
     if cell_reading.strip():
         return cell_reading
     return raw_reading[:width].ljust(width)
+
+
+def grid_from_payload(value: Any) -> list[list[str]]:
+    if not isinstance(value, list) or len(value) != ROWS:
+        raise ValueError("A 13-row grid is required.")
+    grid = empty_grid()
+    for row_index, row in enumerate(value[:ROWS]):
+        if not isinstance(row, list):
+            continue
+        for col_index, cell in enumerate(row[:COLS]):
+            grid[row_index][col_index] = clean_ocr_text(str(cell))[:1] if cell else ""
+    return normalize_grid_guards(grid)
+
+
+def whole_grid_focused_recheck(
+    warped: Image.Image,
+    grid: list[list[str]],
+    mode: str,
+) -> tuple[list[list[str]], dict[str, int]]:
+    mode = mode if mode in {"conservative", "balanced", "aggressive"} else "conservative"
+    updated = normalize_grid_guards([[cell for cell in row] for row in grid])
+    summary = {
+        "rowsChecked": 0,
+        "cellsFilled": 0,
+        "cellsReplaced": 0,
+        "dashesRecovered": 0,
+        "conflictsKept": 0,
+        "rowsSkipped": 0,
+    }
+    allowed = set("ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789<>/().°-+ ")
+
+    for row in range(1, ROWS + 1):
+        summary["rowsChecked"] += 1
+        focused = focused_grid_read(warped, row, FIRST_DATA_COL, LAST_DATA_COL, "")
+        focused = focused[: LAST_DATA_COL - FIRST_DATA_COL + 1].ljust(LAST_DATA_COL - FIRST_DATA_COL + 1)
+        current_row = updated[row - 1]
+        current_snapshot = current_row[:]
+        current_compact = "".join(cell or "" for cell in current_row[FIRST_DATA_COL : LAST_DATA_COL + 1])
+        focused_compact = "".join(char for char in focused if char and not char.isspace())
+        current_text = row_string_from_cells(current_row)
+        focused_text = f" {focused} "
+        focused_score = mcdu_row_score(focused_text)
+        current_score = mcdu_row_score(current_text)
+        if (
+            mode in {"balanced", "aggressive"}
+            and focused_compact
+            and focused_score >= 35.0
+            and len(focused_compact) >= max(3, int(len(current_compact) * 0.55))
+            and focused_score >= current_score + 10.0
+        ):
+            for offset, char in enumerate(focused):
+                col = FIRST_DATA_COL + offset
+                updated[row - 1][col] = "" if char.isspace() else clean_ocr_text(char)[:1]
+            summary["cellsReplaced"] += sum(
+                1
+                for offset, char in enumerate(focused)
+                if clean_ocr_text(char).strip()
+                and current_snapshot[FIRST_DATA_COL + offset] != clean_ocr_text(char)[:1]
+            )
+            continue
+        if mode != "aggressive" and (current_score >= 30.0 or focused_score < 25.0):
+            continue
+        if (
+            mode != "aggressive"
+            and current_compact
+            and focused_compact
+            and difflib.SequenceMatcher(None, current_compact, focused_compact).ratio() < 0.42
+        ):
+            summary["rowsSkipped"] += 1
+            continue
+
+        for offset, char in enumerate(focused):
+            col = FIRST_DATA_COL + offset
+            char = clean_ocr_text(char)[:1]
+            if not char or char.isspace() or char not in allowed:
+                continue
+            current = updated[row - 1][col]
+            if not current:
+                has_left_context = any(updated[row - 1][nearby] for nearby in range(max(FIRST_DATA_COL, col - 2), col))
+                has_right_context = any(updated[row - 1][nearby] for nearby in range(col + 1, min(LAST_DATA_COL, col + 2) + 1))
+                if mode != "aggressive" and not (has_left_context and has_right_context):
+                    continue
+                updated[row - 1][col] = char
+                if char == "-":
+                    summary["dashesRecovered"] += 1
+                else:
+                    summary["cellsFilled"] += 1
+                continue
+            if current == char:
+                continue
+            if mode == "aggressive":
+                updated[row - 1][col] = char
+                summary["cellsReplaced"] += 1
+            else:
+                summary["conflictsKept"] += 1
+
+    updated = recover_dash_lines(updated, warped) if mode in {"balanced", "aggressive"} else updated
+    updated = disambiguate_o_zero(updated)
+    updated = apply_corrections(updated)
+    return normalize_grid_guards(updated), summary
 
 
 def review_requirements(payload: dict[str, Any]) -> dict[str, Any]:
@@ -1311,6 +1504,14 @@ def analyze(payload: dict[str, Any]) -> dict[str, Any]:
     grid = apply_templates(grid, warped)
     grid = disambiguate_o_zero(grid)
     corrected_grid = apply_corrections(grid)
+    verification_summary = None
+    verification = payload.get("verification")
+    if isinstance(verification, dict) and bool(verification.get("enabled")):
+        corrected_grid, verification_summary = whole_grid_focused_recheck(
+            warped,
+            corrected_grid,
+            str(verification.get("mode", "conservative")),
+        )
 
     preview_id = f"{uuid.uuid4().hex}.png"
     preview_path = EXPORTS / preview_id
@@ -1322,7 +1523,19 @@ def analyze(payload: dict[str, Any]) -> dict[str, Any]:
         "boxes": boxes,
         "calibration": geometry,
         "previewUrl": f"/data/exports/{preview_id}",
+        "verification": verification_summary,
     }
+
+
+def refine_grid(payload: dict[str, Any]) -> dict[str, Any]:
+    image = load_image(str(payload["image"]))
+    corners = payload.get("corners")
+    if not isinstance(corners, list) or len(corners) != 4:
+        raise ValueError("Four screen corners are required.")
+    grid = grid_from_payload(payload.get("grid"))
+    warped = warp_screen(image, corners)
+    refined, summary = whole_grid_focused_recheck(warped, grid, str(payload.get("mode", "conservative")))
+    return {"grid": refined, "verification": summary}
 
 
 def add_table_header(table: Any) -> None:
@@ -1454,6 +1667,8 @@ class McmduHandler(SimpleHTTPRequestHandler):
                 json_response(self, HTTPStatus.OK, remember_templates(payload))
             elif self.path == "/api/review-requirements":
                 json_response(self, HTTPStatus.OK, review_requirements(payload))
+            elif self.path == "/api/refine-grid":
+                json_response(self, HTTPStatus.OK, refine_grid(payload))
             else:
                 json_response(self, HTTPStatus.NOT_FOUND, {"error": "Unknown endpoint."})
         except Exception as exc:  # noqa: BLE001 - API boundary should return useful errors.

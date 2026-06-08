@@ -16,6 +16,10 @@ const detectButton = document.querySelector("#detectButton");
 const photoViewButton = document.querySelector("#photoViewButton");
 const flatViewButton = document.querySelector("#flatViewButton");
 const gridTable = document.querySelector("#gridTable");
+const wholeGridVerify = document.querySelector("#wholeGridVerify");
+const verificationMode = document.querySelector("#verificationMode");
+const refineGridButton = document.querySelector("#refineGridButton");
+const verificationSummary = document.querySelector("#verificationSummary");
 const requirementRow = document.querySelector("#requirementRow");
 const requirementStart = document.querySelector("#requirementStart");
 const requirementEnd = document.querySelector("#requirementEnd");
@@ -415,6 +419,24 @@ function renderGridTable(grid = makeEmptyGrid()) {
   gridTable.appendChild(tbody);
 }
 
+function renderVerificationSummary(summary) {
+  if (!summary) {
+    verificationSummary.hidden = true;
+    verificationSummary.textContent = "";
+    return;
+  }
+  verificationSummary.hidden = false;
+  const parts = [
+    `${summary.rowsChecked || 0} rows checked`,
+    `${summary.cellsFilled || 0} cells filled`,
+    `${summary.cellsReplaced || 0} cells replaced`,
+    `${summary.dashesRecovered || 0} dashes recovered`,
+    `${summary.conflictsKept || 0} conflicts kept`,
+    `${summary.rowsSkipped || 0} noisy rows skipped`,
+  ];
+  verificationSummary.textContent = parts.join(", ");
+}
+
 function getCurrentGrid() {
   const grid = makeEmptyGrid();
   gridTable.querySelectorAll("td[contenteditable='true']").forEach((cell) => {
@@ -528,6 +550,7 @@ fileInput.addEventListener("change", () => {
       analyzeButton.disabled = false;
       exportButton.disabled = true;
       rememberButton.disabled = true;
+      refineGridButton.disabled = false;
       state.flatImage = null;
       state.flatUrl = "";
       setViewMode("photo");
@@ -617,16 +640,51 @@ analyzeButton.addEventListener("click", async () => {
     const result = await postJson("/api/analyze", {
       image: state.imageDataUrl,
       corners: getGridCorners(),
+      verification: {
+        enabled: wholeGridVerify.checked,
+        mode: verificationMode.value,
+      },
     });
     state.sourceGrid = normalizeGridGuards(result.grid);
     renderGridTable(state.sourceGrid);
+    renderVerificationSummary(result.verification);
     exportButton.disabled = false;
     rememberButton.disabled = false;
+    refineGridButton.disabled = false;
     const boxCount = Array.isArray(result.boxes) ? result.boxes.length : 0;
-    setStatus(`OCR complete: ${boxCount} character boxes, ${result.words.length} text blocks`);
+    const refined = result.verification ? `, ${result.verification.cellsFilled + result.verification.cellsReplaced} focused updates` : "";
+    setStatus(`OCR complete: ${boxCount} character boxes, ${result.words.length} text blocks${refined}`);
   } catch (error) {
     setStatus(error.message);
   } finally {
+    analyzeButton.disabled = false;
+  }
+});
+
+refineGridButton.addEventListener("click", async () => {
+  if (!state.image) {
+    return;
+  }
+  refineGridButton.disabled = true;
+  analyzeButton.disabled = true;
+  setStatus("Running focused recheck across the grid");
+  try {
+    const result = await postJson("/api/refine-grid", {
+      image: state.imageDataUrl,
+      corners: getGridCorners(),
+      grid: getCurrentGrid(),
+      mode: verificationMode.value,
+    });
+    state.sourceGrid = normalizeGridGuards(result.grid);
+    renderGridTable(state.sourceGrid);
+    renderVerificationSummary(result.verification);
+    exportButton.disabled = false;
+    rememberButton.disabled = false;
+    setStatus(`Focused recheck complete: ${result.verification.cellsFilled + result.verification.cellsReplaced} updates`);
+  } catch (error) {
+    setStatus(error.message);
+  } finally {
+    refineGridButton.disabled = false;
     analyzeButton.disabled = false;
   }
 });
