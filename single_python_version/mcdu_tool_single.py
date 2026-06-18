@@ -946,7 +946,7 @@ class McmduDesktopTool:
 
     def export_word(self) -> None:
         grid = self.get_grid()
-        default_name = f"mcmdu-grid-{uuid.uuid4().hex[:8]}.docx"
+        default_name = f"mcdu-grid-{uuid.uuid4().hex[:8]}.docx"
         filename = filedialog.asksaveasfilename(
             title="Save Word File",
             initialdir=str(EXPORTS),

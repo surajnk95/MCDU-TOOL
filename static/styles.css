@@ -198,6 +198,12 @@ button:disabled {
   background: #eef4f2;
 }
 
+.ocr-options {
+  display: flex;
+  align-items: center;
+  margin-top: 10px;
+}
+
 .verification-panel label {
   display: grid;
   gap: 5px;
@@ -437,6 +443,11 @@ td[contenteditable="true"] {
 
 td[contenteditable="true"]:focus {
   box-shadow: inset 0 0 0 2px var(--warn);
+}
+
+td.low-confidence {
+  background: #fff1d6;
+  color: #7d470d;
 }
 
 td.guard-cell {

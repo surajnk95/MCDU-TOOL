@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>777-9 MCDU Grid Tool</title>
-    <link rel="stylesheet" href="/styles.css?v=focused-grid-pass" />
+    <link rel="stylesheet" href="/styles.css?v=hybrid-ocr" />
   </head>
   <body>
     <header class="topbar">
@@ -56,6 +56,12 @@
           <button id="flatViewButton" type="button" disabled>Flattened View</button>
           <button id="analyzeButton" class="primary" type="button" disabled>Analyze Grid</button>
           <button id="exportButton" type="button" disabled>Export Word File</button>
+        </div>
+        <div class="ocr-options">
+          <label class="toggle-label">
+            <input id="hybridOcr" type="checkbox" checked />
+            Hybrid OCR (Tesseract + PaddleOCR when installed)
+          </label>
         </div>
       </section>
 
@@ -127,6 +133,6 @@
       </section>
     </main>
 
-    <script src="/app.js?v=focused-grid-pass"></script>
+    <script src="/app.js?v=hybrid-ocr"></script>
   </body>
 </html>

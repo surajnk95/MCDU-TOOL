@@ -20,6 +20,7 @@ const wholeGridVerify = document.querySelector("#wholeGridVerify");
 const verificationMode = document.querySelector("#verificationMode");
 const refineGridButton = document.querySelector("#refineGridButton");
 const verificationSummary = document.querySelector("#verificationSummary");
+const hybridOcr = document.querySelector("#hybridOcr");
 const requirementRow = document.querySelector("#requirementRow");
 const requirementStart = document.querySelector("#requirementStart");
 const requirementEnd = document.querySelector("#requirementEnd");
@@ -51,6 +52,7 @@ const state = {
   dragging: -1,
   viewMode: "photo",
   sourceGrid: makeEmptyGrid(),
+  confidenceGrid: Array.from({ length: ROWS }, () => Array.from({ length: COLS }, () => 0)),
   requirements: [],
 };
 
@@ -379,7 +381,7 @@ function findHandle(point) {
   return nearest;
 }
 
-function renderGridTable(grid = makeEmptyGrid()) {
+function renderGridTable(grid = makeEmptyGrid(), confidenceGrid = state.confidenceGrid) {
   gridTable.textContent = "";
   const thead = document.createElement("thead");
   const header = document.createElement("tr");
@@ -404,11 +406,42 @@ function renderGridTable(grid = makeEmptyGrid()) {
       td.dataset.row = String(row);
       td.dataset.col = String(col);
       td.textContent = col >= FIRST_DATA_COL && col <= LAST_DATA_COL ? grid[row]?.[col]?.trim() || "" : "";
+      const confidence = Number(confidenceGrid?.[row]?.[col] || 0);
+      if (td.textContent && confidence > 0 && confidence < 0.62) {
+        td.classList.add("low-confidence");
+        td.title = `Low OCR confidence: ${Math.round(confidence * 100)}%`;
+      }
       if (col < FIRST_DATA_COL || col > LAST_DATA_COL) {
         td.contentEditable = "false";
         td.classList.add("guard-cell");
       }
       td.addEventListener("input", () => {
+        const value = td.textContent.replace(/\s+/g, "").slice(-1).toUpperCase();
+        if (td.textContent !== value) {
+          td.textContent = value;
+        }
+        td.classList.remove("low-confidence");
+        td.removeAttribute("title");
+        exportButton.disabled = false;
+        rememberButton.disabled = false;
+      });
+      td.addEventListener("paste", (event) => {
+        event.preventDefault();
+        const text = event.clipboardData?.getData("text")?.replace(/\s+/g, "").toUpperCase() || "";
+        const cells = Array.from(gridTable.querySelectorAll(`td[data-row="${row}"][contenteditable="true"]`));
+        let targetCol = col;
+        for (const char of text) {
+          if (targetCol > LAST_DATA_COL) {
+            break;
+          }
+          const target = cells.find((cell) => Number(cell.dataset.col) === targetCol);
+          if (target) {
+            target.textContent = char;
+            target.classList.remove("low-confidence");
+            target.removeAttribute("title");
+          }
+          targetCol += 1;
+        }
         exportButton.disabled = false;
         rememberButton.disabled = false;
       });
@@ -443,7 +476,7 @@ function getCurrentGrid() {
     const row = Number(cell.dataset.row);
     const col = Number(cell.dataset.col);
     if (col >= FIRST_DATA_COL && col <= LAST_DATA_COL) {
-      grid[row][col] = cell.textContent.slice(0, 8).trim();
+      grid[row][col] = cell.textContent.replace(/\s+/g, "").slice(0, 1).toUpperCase();
     }
   });
   return normalizeGridGuards(grid);
@@ -553,6 +586,7 @@ fileInput.addEventListener("change", () => {
       refineGridButton.disabled = false;
       state.flatImage = null;
       state.flatUrl = "";
+      state.confidenceGrid = Array.from({ length: ROWS }, () => Array.from({ length: COLS }, () => 0));
       setViewMode("photo");
       renderGridTable();
       setStatus("Image loaded");
@@ -644,16 +678,23 @@ analyzeButton.addEventListener("click", async () => {
         enabled: wholeGridVerify.checked,
         mode: verificationMode.value,
       },
+      hybridOcr: hybridOcr.checked,
     });
     state.sourceGrid = normalizeGridGuards(result.grid);
-    renderGridTable(state.sourceGrid);
+    state.confidenceGrid = result.confidenceGrid || Array.from({ length: ROWS }, () => Array.from({ length: COLS }, () => 0));
+    renderGridTable(state.sourceGrid, state.confidenceGrid);
     renderVerificationSummary(result.verification);
     exportButton.disabled = false;
     rememberButton.disabled = false;
     refineGridButton.disabled = false;
     const boxCount = Array.isArray(result.boxes) ? result.boxes.length : 0;
     const refined = result.verification ? `, ${result.verification.cellsFilled + result.verification.cellsReplaced} focused updates` : "";
-    setStatus(`OCR complete: ${boxCount} character boxes, ${result.words.length} text blocks${refined}`);
+    const preprocessing = result.preprocessing ? `, ${result.preprocessing} image pass` : "";
+    const engines = result.ocrEngines?.used?.join(" + ") || "tesseract";
+    const paddleNote = result.ocrEngines?.paddleError && hybridOcr.checked
+      ? `; Paddle unavailable (${result.ocrEngines.paddleError})`
+      : "";
+    setStatus(`OCR complete using ${engines}: ${boxCount} character boxes, ${result.words.length} text blocks${preprocessing}${refined}${paddleNote}`);
   } catch (error) {
     setStatus(error.message);
   } finally {
@@ -676,7 +717,8 @@ refineGridButton.addEventListener("click", async () => {
       mode: verificationMode.value,
     });
     state.sourceGrid = normalizeGridGuards(result.grid);
-    renderGridTable(state.sourceGrid);
+    state.confidenceGrid = Array.from({ length: ROWS }, () => Array.from({ length: COLS }, () => 0));
+    renderGridTable(state.sourceGrid, state.confidenceGrid);
     renderVerificationSummary(result.verification);
     exportButton.disabled = false;
     rememberButton.disabled = false;
@@ -722,13 +764,15 @@ rememberButton.addEventListener("click", async () => {
   rememberButton.disabled = true;
   setStatus(`Remembering ${changes.length} correction rows`);
   try {
+    const sourceGrid = state.sourceGrid;
     await postJson("/api/remember-grid", {
-      sourceGrid: state.sourceGrid,
+      sourceGrid,
       grid: current,
     });
     const learned = await postJson("/api/remember-templates", {
       image: state.imageDataUrl,
       corners: getGridCorners(),
+      sourceGrid,
       grid: current,
     });
     state.sourceGrid = current;

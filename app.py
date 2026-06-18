@@ -10,6 +10,8 @@ import re
 import shutil
 import subprocess
 import tempfile
+import threading
+import time
 import uuid
 from http import HTTPStatus
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
@@ -41,7 +43,10 @@ LAST_DATA_COL = 38
 SCREEN_W = 1600
 MIN_SCREEN_H = 900
 MAX_SCREEN_H = 1400
-OCR_WHITELIST = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789°º˚/.-<>"
+OCR_WHITELIST = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789°º˚/.-<>%:"
+MAX_REQUEST_BYTES = 50 * 1024 * 1024
+MAX_EXPORT_FILES = 80
+EXPORT_MAX_AGE_SECONDS = 7 * 24 * 60 * 60
 MCDU_WORD_HINTS = {
     "ACT",
     "RTE",
@@ -143,6 +148,11 @@ def find_tesseract() -> str:
 
 
 TESSERACT = find_tesseract()
+_PADDLE_OCR: Any | None = None
+_PADDLE_ERROR = ""
+_PADDLE_LOCK = threading.Lock()
+_PADDLE_READY = threading.Event()
+_PADDLE_INITIALIZING = False
 
 
 def ensure_dirs() -> None:
@@ -152,6 +162,24 @@ def ensure_dirs() -> None:
         CORRECTIONS.write_text("{}", encoding="utf-8")
     if not TEMPLATES.exists():
         TEMPLATES.write_text("{}", encoding="utf-8")
+    cleanup_exports()
+
+
+def cleanup_exports() -> None:
+    if not EXPORTS.exists():
+        return
+    now = time.time()
+    files = sorted(
+        (path for path in EXPORTS.iterdir() if path.is_file() and path.suffix.lower() == ".png"),
+        key=lambda path: path.stat().st_mtime,
+        reverse=True,
+    )
+    for index, path in enumerate(files):
+        try:
+            if index >= MAX_EXPORT_FILES or now - path.stat().st_mtime > EXPORT_MAX_AGE_SECONDS:
+                path.unlink()
+        except OSError:
+            continue
 
 
 def json_response(handler: SimpleHTTPRequestHandler, status: int, payload: dict[str, Any]) -> None:
@@ -167,6 +195,8 @@ def read_json_body(handler: SimpleHTTPRequestHandler) -> dict[str, Any]:
     length = int(handler.headers.get("Content-Length", "0"))
     if length <= 0:
         return {}
+    if length > MAX_REQUEST_BYTES:
+        raise ValueError("Image request is too large. Use an image below 50 MB.")
     raw = handler.rfile.read(length)
     return json.loads(raw.decode("utf-8"))
 
@@ -261,6 +291,15 @@ def preprocess_for_ocr(image: Image.Image) -> Image.Image:
     return gray
 
 
+def preprocessing_variants(image: Image.Image) -> list[tuple[str, Image.Image]]:
+    gray = ImageOps.grayscale(image)
+    return [
+        ("contrast", preprocess_for_ocr(image)),
+        ("inverted", ImageOps.invert(gray)),
+        ("grayscale", ImageOps.autocontrast(gray, cutoff=1)),
+    ]
+
+
 def cell_feature(image: Image.Image, row: int, col: int) -> list[float]:
     screen_w, screen_h = image.size
     cell_w = screen_w / COLS
@@ -319,7 +358,7 @@ def classify_from_templates(feature: list[float], templates: dict[str, list[list
             if distance < best_distance:
                 best_char = char
                 best_distance = distance
-    if best_char and best_distance <= 0.22:
+    if best_char and best_distance <= 0.16:
         return best_char, best_distance
     return None
 
@@ -337,6 +376,295 @@ def word_quality(word: dict[str, Any]) -> float:
     if re.fullmatch(r"FL\d{2,3}", compact):
         score += 30.0
     return score
+
+
+def ocr_words_score(words: list[dict[str, Any]], image_height: int) -> float:
+    score = sum(word_quality(word) for word in words)
+    row_count = len(
+        {
+            int((float(word["top"]) + float(word["height"]) * 0.5) / max(1.0, image_height / ROWS))
+            for word in words
+        }
+    )
+    score += row_count * 18.0
+    score -= sum(20.0 for word in words if len(str(word["text"])) > 18)
+    return score
+
+
+def initialize_paddle_ocr() -> None:
+    global _PADDLE_OCR, _PADDLE_ERROR
+    try:
+        try:
+            from paddleocr import PaddleOCR
+        except (ImportError, OSError) as exc:
+            _PADDLE_ERROR = f"PaddleOCR unavailable: {exc}"
+            return
+
+        constructor_options = (
+            {
+                "lang": "en",
+                "text_detection_model_name": os.environ.get(
+                    "PADDLE_DETECTION_MODEL",
+                    "PP-OCRv5_mobile_det",
+                ),
+                "text_recognition_model_name": os.environ.get(
+                    "PADDLE_RECOGNITION_MODEL",
+                    "en_PP-OCRv5_mobile_rec",
+                ),
+                "use_doc_orientation_classify": False,
+                "use_doc_unwarping": False,
+                "use_textline_orientation": False,
+            },
+            {"lang": "en", "use_angle_cls": False, "show_log": False},
+            {"lang": "en"},
+        )
+        errors: list[str] = []
+        for options in constructor_options:
+            try:
+                _PADDLE_OCR = PaddleOCR(**options)
+                return
+            except (TypeError, ValueError) as exc:
+                errors.append(str(exc))
+            except Exception as exc:  # noqa: BLE001 - optional OCR engine boundary
+                _PADDLE_ERROR = f"PaddleOCR could not start: {exc}"
+                return
+        _PADDLE_ERROR = f"PaddleOCR could not start: {'; '.join(errors)}"
+    finally:
+        _PADDLE_READY.set()
+
+
+def get_paddle_ocr() -> tuple[Any | None, str]:
+    global _PADDLE_INITIALIZING
+    if _PADDLE_OCR is not None:
+        return _PADDLE_OCR, ""
+    if _PADDLE_ERROR:
+        return None, _PADDLE_ERROR
+
+    with _PADDLE_LOCK:
+        if not _PADDLE_INITIALIZING:
+            _PADDLE_INITIALIZING = True
+            threading.Thread(
+                target=initialize_paddle_ocr,
+                name="paddle-ocr-initializer",
+                daemon=True,
+            ).start()
+
+    wait_seconds = max(0.0, float(os.environ.get("PADDLE_INIT_WAIT_SECONDS", "12")))
+    _PADDLE_READY.wait(timeout=wait_seconds)
+    if _PADDLE_OCR is not None:
+        return _PADDLE_OCR, ""
+    if _PADDLE_ERROR:
+        return None, _PADDLE_ERROR
+    return None, "PaddleOCR models are initializing in the background; analyze again when ready."
+
+
+def paddle_result_payload(result: Any) -> dict[str, Any] | None:
+    if isinstance(result, dict):
+        if isinstance(result.get("res"), dict):
+            return result["res"]
+        if "rec_texts" in result or "dt_polys" in result:
+            return result
+    json_value = getattr(result, "json", None)
+    if callable(json_value):
+        json_value = json_value()
+    if isinstance(json_value, str):
+        try:
+            json_value = json.loads(json_value)
+        except json.JSONDecodeError:
+            json_value = None
+    if isinstance(json_value, dict):
+        return paddle_result_payload(json_value)
+    return None
+
+
+def paddle_words_from_payload(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    def first_present(*keys: str) -> Any:
+        for key in keys:
+            value = payload.get(key)
+            if value is not None:
+                return value
+        return []
+
+    texts = first_present("rec_texts", "texts")
+    scores = first_present("rec_scores", "scores")
+    polygons = first_present("dt_polys", "rec_polys", "polys")
+    words: list[dict[str, Any]] = []
+    for index, text_value in enumerate(texts):
+        text = clean_ocr_text(str(text_value))
+        if not text or index >= len(polygons):
+            continue
+        try:
+            points = np.asarray(polygons[index], dtype=np.float32).reshape(-1, 2)
+        except (TypeError, ValueError):
+            continue
+        if points.size < 8:
+            continue
+        left = float(np.min(points[:, 0]))
+        top = float(np.min(points[:, 1]))
+        right = float(np.max(points[:, 0]))
+        bottom = float(np.max(points[:, 1]))
+        score = float(scores[index]) if index < len(scores) else 0.5
+        if score <= 1.0:
+            score *= 100.0
+        words.append(
+            {
+                "text": text,
+                "conf": max(0.0, min(100.0, score)),
+                "left": int(round(left)),
+                "top": int(round(top)),
+                "width": max(1, int(round(right - left))),
+                "height": max(1, int(round(bottom - top))),
+                "engine": "paddle",
+            }
+        )
+    return words
+
+
+def paddle_words_from_legacy(result: Any) -> list[dict[str, Any]]:
+    lines = result
+    if isinstance(lines, list) and len(lines) == 1 and isinstance(lines[0], list):
+        lines = lines[0]
+    words: list[dict[str, Any]] = []
+    if not isinstance(lines, list):
+        return words
+    for line in lines:
+        if not isinstance(line, (list, tuple)) or len(line) < 2:
+            continue
+        polygon, recognition = line[0], line[1]
+        if not isinstance(recognition, (list, tuple)) or not recognition:
+            continue
+        words.extend(
+            paddle_words_from_payload(
+                {
+                    "rec_texts": [recognition[0]],
+                    "rec_scores": [recognition[1] if len(recognition) > 1 else 0.5],
+                    "dt_polys": [polygon],
+                }
+            )
+        )
+    return words
+
+
+def boxes_overlap_ratio(first: dict[str, Any], second: dict[str, Any]) -> float:
+    first_right = float(first["left"]) + float(first["width"])
+    first_bottom = float(first["top"]) + float(first["height"])
+    second_right = float(second["left"]) + float(second["width"])
+    second_bottom = float(second["top"]) + float(second["height"])
+    intersection_w = max(0.0, min(first_right, second_right) - max(float(first["left"]), float(second["left"])))
+    intersection_h = max(0.0, min(first_bottom, second_bottom) - max(float(first["top"]), float(second["top"])))
+    intersection = intersection_w * intersection_h
+    first_area = max(1.0, float(first["width"]) * float(first["height"]))
+    second_area = max(1.0, float(second["width"]) * float(second["height"]))
+    return intersection / min(first_area, second_area)
+
+
+def merge_edge_words(
+    words: list[dict[str, Any]],
+    edge_words: list[dict[str, Any]],
+    image_size: tuple[int, int],
+    padding: int,
+) -> list[dict[str, Any]]:
+    _, image_h = image_size
+    candidates: list[dict[str, Any]] = []
+    for raw_word in edge_words:
+        word = dict(raw_word)
+        word["left"] = int(word["left"]) - padding
+        word["top"] = int(word["top"]) - padding
+        word["sourcePass"] = "edge"
+        bottom = float(word["top"]) + float(word["height"])
+        if float(word["top"]) > image_h * 0.10 and bottom < image_h * 0.90:
+            continue
+        candidates.append(word)
+    return merge_unique_words(words, candidates)
+
+
+def merge_unique_words(
+    words: list[dict[str, Any]],
+    candidates: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    merged = [dict(word) for word in words]
+    for word in candidates:
+        if any(boxes_overlap_ratio(word, existing) >= 0.35 for existing in merged):
+            continue
+        merged.append(dict(word))
+    return sorted(merged, key=lambda item: (int(item["top"]), int(item["left"])))
+
+
+def remap_crop_words(
+    words: list[dict[str, Any]],
+    crop_origin: tuple[int, int],
+    scale: float,
+    padding: int,
+) -> list[dict[str, Any]]:
+    mapped: list[dict[str, Any]] = []
+    for raw_word in words:
+        word = dict(raw_word)
+        word["left"] = int(round((float(word["left"]) - padding) / scale + crop_origin[0]))
+        word["top"] = int(round((float(word["top"]) - padding) / scale + crop_origin[1]))
+        word["width"] = max(1, int(round(float(word["width"]) / scale)))
+        word["height"] = max(1, int(round(float(word["height"]) / scale)))
+        word["sourcePass"] = "corner"
+        mapped.append(word)
+    return mapped
+
+
+def run_paddle_ocr(image: Image.Image) -> tuple[list[dict[str, Any]], str]:
+    engine, error = get_paddle_ocr()
+    if engine is None:
+        return [], error
+    image_array = np.asarray(image.convert("RGB"))
+    try:
+        if hasattr(engine, "predict"):
+            padding = 30
+            padded = ImageOps.expand(image, border=padding, fill=(0, 0, 0))
+            cell_h = image.height / ROWS
+            crop_scale = 2.0
+            crop_padding = 40
+            focused_regions = [
+                (int(image.width * 0.62), 0, image.width, min(image.height, int(cell_h * 1.8))),
+                (
+                    int(image.width * 0.62),
+                    max(0, int(image.height - cell_h * 1.6)),
+                    image.width,
+                    image.height,
+                ),
+                (
+                    0,
+                    int(image.height * 0.52),
+                    int(image.width * 0.38),
+                    int(image.height * 0.75),
+                ),
+            ]
+            corner_crops: list[tuple[Image.Image, tuple[int, int]]] = []
+            for x1, y1, x2, y2 in focused_regions:
+                crop = image.crop((x1, y1, x2, y2))
+                crop = crop.resize(
+                    (max(1, int(crop.width * crop_scale)), max(1, int(crop.height * crop_scale))),
+                    Image.Resampling.LANCZOS,
+                )
+                crop = ImageOps.expand(crop, border=crop_padding, fill=(0, 0, 0))
+                corner_crops.append((crop, (x1, y1)))
+
+            inputs = [image_array, np.asarray(padded.convert("RGB"))]
+            inputs.extend(np.asarray(crop.convert("RGB")) for crop, _ in corner_crops)
+            results = list(engine.predict(input=inputs))
+            parsed: list[list[dict[str, Any]]] = []
+            for result in results[: len(inputs)]:
+                payload = paddle_result_payload(result)
+                parsed.append(paddle_words_from_payload(payload) if payload else [])
+            words = parsed[0] if parsed else []
+            if len(parsed) > 1:
+                words = merge_edge_words(words, parsed[1], image.size, padding)
+            for index, (_, origin) in enumerate(corner_crops, start=2):
+                if index >= len(parsed):
+                    continue
+                mapped = remap_crop_words(parsed[index], origin, crop_scale, crop_padding)
+                words = merge_unique_words(words, mapped)
+        else:
+            words = paddle_words_from_legacy(engine.ocr(image_array, cls=False))
+    except Exception as exc:  # noqa: BLE001 - optional OCR engine boundary
+        return [], f"PaddleOCR failed: {exc}"
+    return sorted(words, key=lambda item: (int(item["top"]), int(item["left"]))), ""
 
 
 def run_tesseract_tsv(image: Image.Image) -> list[dict[str, Any]]:
@@ -391,6 +719,7 @@ def run_tesseract_tsv(image: Image.Image) -> list[dict[str, Any]]:
                         "width": int(row.get("width") or 0),
                         "height": int(row.get("height") or 0),
                         "psm": psm,
+                        "engine": "tesseract",
                     }
                 )
             if words:
@@ -400,19 +729,7 @@ def run_tesseract_tsv(image: Image.Image) -> list[dict[str, Any]]:
         if not candidates:
             return []
 
-        def candidate_score(candidate: list[dict[str, Any]]) -> float:
-            score = sum(word_quality(word) for word in candidate)
-            row_count = len(
-                {
-                    int((float(word["top"]) + float(word["height"]) * 0.5) / max(1.0, image.height / ROWS))
-                    for word in candidate
-                }
-            )
-            score += row_count * 18.0
-            score -= sum(20.0 for word in candidate if len(str(word["text"])) > 18)
-            return score
-
-        best = max(candidates, key=candidate_score)
+        best = max(candidates, key=lambda candidate: ocr_words_score(candidate, image.height))
         return sorted(best, key=lambda item: (int(item["top"]), int(item["left"])))
 
 
@@ -422,58 +739,80 @@ def run_tesseract_boxes(image: Image.Image) -> list[dict[str, Any]]:
     with tempfile.TemporaryDirectory() as temp_dir:
         source = Path(temp_dir) / "screen.png"
         image.save(source)
-
-        command = [
-            TESSERACT,
-            str(source),
-            "stdout",
-            "--psm",
-            "6",
-            "-l",
-            "eng",
-            "-c",
-            f"tessedit_char_whitelist={OCR_WHITELIST}",
-            "makebox",
-        ]
-        try:
-            completed = subprocess.run(command, capture_output=True, text=True, check=False)
-        except FileNotFoundError:
-            return []
-        if completed.returncode != 0:
-            return []
-
-        boxes: list[dict[str, Any]] = []
-        for line in completed.stdout.splitlines():
-            parts = line.split()
-            if len(parts) < 5:
-                continue
-            char = clean_ocr_text(parts[0])
-            if not char:
-                continue
+        candidates: list[list[dict[str, Any]]] = []
+        for psm in ("6", "11"):
+            command = [
+                TESSERACT,
+                str(source),
+                "stdout",
+                "--psm",
+                psm,
+                "--oem",
+                "1",
+                "-l",
+                "eng",
+                "-c",
+                f"tessedit_char_whitelist={OCR_WHITELIST}",
+                "makebox",
+            ]
             try:
-                left = int(parts[1])
-                bottom = int(parts[2])
-                right = int(parts[3])
-                top = int(parts[4])
-            except ValueError:
+                completed = subprocess.run(command, capture_output=True, text=True, check=False)
+            except FileNotFoundError:
+                return []
+            if completed.returncode != 0:
                 continue
-            boxes.append(
-                {
-                    "text": char[:1],
-                    "left": left,
-                    "top": max(0, height - top),
-                    "width": max(0, right - left),
-                    "height": max(0, top - bottom),
-                }
-            )
-        return boxes
+
+            boxes: list[dict[str, Any]] = []
+            for line in completed.stdout.splitlines():
+                parts = line.split()
+                if len(parts) < 5:
+                    continue
+                char = clean_ocr_text(parts[0])
+                if not char:
+                    continue
+                try:
+                    left = int(parts[1])
+                    bottom = int(parts[2])
+                    right = int(parts[3])
+                    top = int(parts[4])
+                except ValueError:
+                    continue
+                boxes.append(
+                    {
+                        "text": char[:1],
+                        "left": left,
+                        "top": max(0, height - top),
+                        "width": max(0, right - left),
+                        "height": max(0, top - bottom),
+                        "psm": psm,
+                    }
+                )
+            if boxes:
+                candidates.append(boxes)
+        if not candidates:
+            return []
+
+        def box_score(boxes: list[dict[str, Any]]) -> float:
+            valid = [
+                box
+                for box in boxes
+                if 2 <= float(box["width"]) <= width / COLS * 2.1
+                and 2 <= float(box["height"]) <= height / ROWS * 1.4
+            ]
+            rows = {
+                int((float(box["top"]) + float(box["height"]) * 0.5) / max(1.0, height / ROWS))
+                for box in valid
+            }
+            return len(valid) + len(rows) * 4.0
+
+        return max(candidates, key=box_score)
 
 
 def clean_ocr_text(text: str) -> str:
     text = text.replace("|", "I")
     text = text.replace("º", "°").replace("˚", "°").replace("Â°", "°")
-    text = re.sub(r"(?<=\d{3})[oO07](?=/)", "°", text)
-    text = re.sub(r"\b(\d{3})(?=/\d)", r"\1°", text)
+    text = re.sub(r"(?<=\d{3})[oO](?=/\d+(?:\.\d+)(?:NM)?\b)", "°", text)
+    text = re.sub(r"\b(\d{3})(?=/\d+(?:\.\d+)(?:NM)?\b)", r"\1°", text)
     text = re.sub(r"\s+", " ", text)
     return text.strip()
 
@@ -481,6 +820,14 @@ def clean_ocr_text(text: str) -> str:
 def normalize_mcdu_phrase(text: str) -> str:
     text = clean_ocr_text(text).upper()
     compact = text.replace(" ", "")
+    if re.fullmatch(r"TOFL\d{2,3}", compact):
+        return f"TO FL{compact[4:]}"
+    if compact == "KBFIETA/FUEL":
+        return "KBFI ETA/FUEL"
+    if compact == "TOT/D":
+        return "TO T/D"
+    if compact in {"ECONSPD", "ECONSP0", "ECONSPOD"}:
+        return "ECON SPD"
     suffix = ">" if compact.endswith(">") else ""
     core = compact[:-1] if suffix else compact
     for source, replacement in MCDU_PHRASE_REPLACEMENTS:
@@ -488,7 +835,13 @@ def normalize_mcdu_phrase(text: str) -> str:
             return f"{replacement}{suffix}"
         if source in core and len(core) <= len(source) + 4:
             return f"{core.replace(source, replacement)}{suffix}"
-    for source, replacement in (("RECHD", "RECMD"), ("NAX", "MAX"), ("PUEL", "FUEL"), ("KOFI", "KBFI")):
+    for source, replacement in (
+        ("RECHD", "RECMD"),
+        ("NAX", "MAX"),
+        ("PUEL", "FUEL"),
+        ("KOFI", "KBFI"),
+        ("1RC", "LRC"),
+    ):
         if source in core:
             core = core.replace(source, replacement)
     original_core = compact[:-1] if suffix else compact
@@ -523,6 +876,10 @@ def row_string_from_cells(row: list[str]) -> str:
 
 def empty_grid() -> list[list[str]]:
     return [["" for _ in range(COLS)] for _ in range(ROWS)]
+
+
+def empty_confidence_grid() -> list[list[float]]:
+    return [[0.0 for _ in range(COLS)] for _ in range(ROWS)]
 
 
 def clamp_data_col(col: int) -> int:
@@ -574,9 +931,18 @@ def calibrate_grid(
         for box in char_boxes
         if 2 <= float(box.get("height") or 0) <= screen_h / ROWS * 1.4
     ]
-    origin_x, cell_w = calibrate_axis(x_centers, screen_w / COLS, COLS)
-    origin_y, cell_h = calibrate_axis(y_centers, screen_h / ROWS, ROWS)
-    return {"origin_x": origin_x, "origin_y": origin_y, "cell_w": cell_w, "cell_h": cell_h}
+    nominal_cell_w = screen_w / COLS
+    nominal_cell_h = screen_h / ROWS
+    origin_x, _ = calibrate_axis(x_centers, nominal_cell_w, COLS)
+    origin_y, _ = calibrate_axis(y_centers, nominal_cell_h, ROWS)
+    # The UI grid is exactly 40 by 13. OCR must use the identical pitch; even a
+    # 1% fitted scale error accumulates into a full-column shift at the right edge.
+    return {
+        "origin_x": origin_x,
+        "origin_y": origin_y,
+        "cell_w": nominal_cell_w,
+        "cell_h": nominal_cell_h,
+    }
 
 
 def place_char(grid: list[list[str]], char_box: dict[str, Any], geometry: dict[str, float]) -> bool:
@@ -608,9 +974,35 @@ def place_char(grid: list[list[str]], char_box: dict[str, Any], geometry: dict[s
     return False
 
 
+def build_character_grid(
+    char_boxes: list[dict[str, Any]],
+    geometry: dict[str, float],
+) -> tuple[list[list[str]], list[list[float]]]:
+    grid = empty_grid()
+    confidence = empty_confidence_grid()
+    cell_w = geometry["cell_w"]
+    cell_h = geometry["cell_h"]
+    for box in sorted(char_boxes, key=lambda item: (float(item["top"]), float(item["left"]))):
+        text = clean_ocr_text(str(box.get("text", "")))[:1]
+        box_w = float(box.get("width") or 0)
+        box_h = float(box.get("height") or 0)
+        if not text or box_w < 2 or box_h < 2 or box_w > cell_w * 2.15 or box_h > cell_h * 1.4:
+            continue
+        center_x = float(box["left"]) + box_w * 0.5
+        center_y = float(box["top"]) + box_h * 0.5
+        row = max(0, min(ROWS - 1, int((center_y - geometry["origin_y"]) / cell_h)))
+        col = clamp_data_col(int((center_x - geometry["origin_x"]) / cell_w))
+        score = min(0.95, 0.50 + min(0.35, box_h / max(1.0, cell_h) * 0.35))
+        if not grid[row][col] or score > confidence[row][col]:
+            grid[row][col] = text
+            confidence[row][col] = score
+    return normalize_grid_guards(grid), confidence
+
+
 def place_word(
     grid: list[list[str]],
     scores: list[list[float]],
+    confidence: list[list[float]],
     word: dict[str, Any],
     geometry: dict[str, float],
 ) -> None:
@@ -650,6 +1042,122 @@ def place_word(
         if not grid[row][col] or quality > scores[row][col] + 10:
             grid[row][col] = char
             scores[row][col] = quality
+            confidence[row][col] = max(0.20, min(0.98, float(word.get("conf") or 0.0) / 100.0))
+
+
+def merge_ocr_grids(
+    word_grid: list[list[str]],
+    word_confidence: list[list[float]],
+    char_grid: list[list[str]],
+    char_confidence: list[list[float]],
+) -> tuple[list[list[str]], list[list[float]]]:
+    merged = empty_grid()
+    confidence = empty_confidence_grid()
+    for row in range(ROWS):
+        for col in range(FIRST_DATA_COL, LAST_DATA_COL + 1):
+            word = word_grid[row][col]
+            char = char_grid[row][col]
+            if char and word == char:
+                merged[row][col] = char
+                confidence[row][col] = min(1.0, max(char_confidence[row][col], word_confidence[row][col]) + 0.08)
+            elif char and not word:
+                nearby = range(max(FIRST_DATA_COL, col - 2), min(LAST_DATA_COL, col + 2) + 1)
+                same_nearby = any(word_grid[row][nearby_col] == char for nearby_col in nearby)
+                left_context = any(word_grid[row][nearby_col] for nearby_col in range(max(FIRST_DATA_COL, col - 2), col))
+                right_context = any(
+                    word_grid[row][nearby_col]
+                    for nearby_col in range(col + 1, min(LAST_DATA_COL, col + 2) + 1)
+                )
+                if (char in {"<", ">", "°", "-"} and not same_nearby) or (
+                    left_context and right_context and not same_nearby
+                ):
+                    merged[row][col] = char
+                    confidence[row][col] = min(char_confidence[row][col], 0.72)
+            elif word:
+                merged[row][col] = word
+                confidence[row][col] = word_confidence[row][col] if not char else min(word_confidence[row][col], 0.58)
+    return normalize_grid_guards(merged), confidence
+
+
+def fuse_engine_grids(
+    primary_grid: list[list[str]],
+    primary_confidence: list[list[float]],
+    secondary_grid: list[list[str]],
+    secondary_confidence: list[list[float]],
+) -> tuple[list[list[str]], list[list[float]], dict[str, int]]:
+    fused = normalize_grid_guards(primary_grid)
+    confidence = [row[:] for row in primary_confidence]
+    summary = {"rowsSelected": 0, "agreements": 0, "blanksFilled": 0, "disagreements": 0}
+    for row in range(ROWS):
+        primary_runs: dict[int, int] = {}
+        col = FIRST_DATA_COL
+        while col <= LAST_DATA_COL:
+            if not primary_grid[row][col]:
+                col += 1
+                continue
+            start = col
+            while col <= LAST_DATA_COL and primary_grid[row][col]:
+                col += 1
+            for run_col in range(start, col):
+                primary_runs[run_col] = col - start
+
+        secondary_chars = [
+            col
+            for col in range(FIRST_DATA_COL, LAST_DATA_COL + 1)
+            if secondary_grid[row][col]
+        ]
+        secondary_average = (
+            sum(secondary_confidence[row][col] for col in secondary_chars) / len(secondary_chars)
+            if secondary_chars
+            else 0.0
+        )
+        primary_text = row_string_from_cells(primary_grid[row])
+        secondary_text = row_string_from_cells(secondary_grid[row])
+        primary_is_separator = primary_text.count("-") >= 8
+        use_secondary_row = (
+            len(secondary_chars) >= 2
+            and secondary_average >= 0.80
+            and not (primary_is_separator and secondary_text.count("-") < 4)
+        )
+        if use_secondary_row:
+            fused[row] = secondary_grid[row][:]
+            confidence[row] = secondary_confidence[row][:]
+            summary["rowsSelected"] += 1
+
+        for col in range(FIRST_DATA_COL, LAST_DATA_COL + 1):
+            primary = primary_grid[row][col]
+            secondary = secondary_grid[row][col]
+            if primary and secondary and primary == secondary:
+                summary["agreements"] += 1
+                confidence[row][col] = min(
+                    1.0,
+                    max(confidence[row][col], secondary_confidence[row][col]) + 0.10,
+                )
+            elif (
+                not use_secondary_row
+                and not primary
+                and secondary
+                and secondary_confidence[row][col] >= 0.50
+            ):
+                summary["blanksFilled"] += 1
+                fused[row][col] = secondary
+                confidence[row][col] = min(0.78, secondary_confidence[row][col])
+            elif primary and secondary and primary != secondary:
+                summary["disagreements"] += 1
+                confidence[row][col] = min(confidence[row][col], 0.45)
+            elif (
+                use_secondary_row
+                and primary
+                and not secondary
+                and primary_confidence[row][col] >= 0.60
+                and (primary in {"-", "°", "<", ">"} or primary_runs.get(col, 0) >= 2)
+            ):
+                nearby = range(max(FIRST_DATA_COL, col - 2), min(LAST_DATA_COL, col + 2) + 1)
+                if not any(secondary_grid[row][nearby_col] for nearby_col in nearby):
+                    fused[row][col] = primary
+                    confidence[row][col] = min(0.72, primary_confidence[row][col])
+                    summary["blanksFilled"] += 1
+    return normalize_grid_guards(fused), confidence, summary
 
 
 def connected_components(mask: np.ndarray) -> list[dict[str, Any]]:
@@ -728,6 +1236,29 @@ def intersect_edge_lines(
     x = (a * d + b) / denominator
     y = c * x + d
     return float(x), float(y)
+
+
+def regularize_quadrilateral(points: list[tuple[float, float]]) -> list[tuple[float, float]]:
+    if len(points) != 4:
+        return points
+    tl, tr, br, bl = points
+    top_width = math.dist(tl, tr)
+    bottom_width = math.dist(bl, br)
+    reference_width = max(1.0, top_width, bottom_width)
+    left_dx = bl[0] - tl[0]
+    right_dx = br[0] - tr[0]
+    width_ratio = max(top_width, bottom_width) / max(1.0, min(top_width, bottom_width))
+    vertical_divergence = abs(left_dx - right_dx) / reference_width
+
+    # Dark-pixel components can be split by a selected magenta field. This most
+    # often drags only the lower-left fit into the display while the other three
+    # edges remain accurate. Reconstruct that single outlier by parallelogram
+    # closure; ordinary phone perspective is retained unless both checks fail.
+    left_is_outlier = abs(left_dx) > abs(right_dx) * 3.0 + reference_width * 0.03
+    if width_ratio > 1.12 and vertical_divergence > 0.12 and left_is_outlier:
+        predicted_bl = (tl[0] + br[0] - tr[0], tl[1] + br[1] - tr[1])
+        return [tl, tr, br, predicted_bl]
+    return points
 
 
 def component_corners(component: dict[str, Any], scale: float) -> list[dict[str, float]]:
@@ -811,6 +1342,8 @@ def component_corners(component: dict[str, Any], scale: float) -> list[dict[str,
                 )
                 if polygon_area < width * height * 0.62:
                     points = fallback
+
+    points = regularize_quadrilateral(points)
 
     inv = 1 / scale
     return [{"x": x * inv, "y": y * inv} for x, y in points]
@@ -1077,13 +1610,13 @@ def whole_grid_focused_recheck(
                 and current_snapshot[FIRST_DATA_COL + offset] != clean_ocr_text(char)[:1]
             )
             continue
-        if mode != "aggressive" and (current_score >= 30.0 or focused_score < 25.0):
+        if mode != "aggressive" and (current_score >= 20.0 or focused_score < 25.0):
             continue
         if (
             mode != "aggressive"
             and current_compact
             and focused_compact
-            and difflib.SequenceMatcher(None, current_compact, focused_compact).ratio() < 0.42
+            and difflib.SequenceMatcher(None, current_compact, focused_compact).ratio() < 0.65
         ):
             summary["rowsSkipped"] += 1
             continue
@@ -1095,8 +1628,8 @@ def whole_grid_focused_recheck(
                 continue
             current = updated[row - 1][col]
             if not current:
-                has_left_context = any(updated[row - 1][nearby] for nearby in range(max(FIRST_DATA_COL, col - 2), col))
-                has_right_context = any(updated[row - 1][nearby] for nearby in range(col + 1, min(LAST_DATA_COL, col + 2) + 1))
+                has_left_context = col > FIRST_DATA_COL and bool(updated[row - 1][col - 1])
+                has_right_context = col < LAST_DATA_COL and bool(updated[row - 1][col + 1])
                 if mode != "aggressive" and not (has_left_context and has_right_context):
                     continue
                 updated[row - 1][col] = char
@@ -1179,12 +1712,14 @@ def review_requirements(payload: dict[str, Any]) -> dict[str, Any]:
 
         if not passed and warped is not None:
             rechecked = focused_grid_read(warped, row, start, end, expected_raw)
-            passed = requirement_matches(requirement, rechecked)
+            recheck_passed = requirement_matches(requirement, rechecked)
             detail = (
-                "Passed after focused OCR recheck; confirm the focused reading."
-                if passed
+                "Focused OCR matched, but the initial grid did not. Confirm this result."
+                if recheck_passed
                 else "Focused OCR recheck also did not match."
             )
+        else:
+            recheck_passed = False
 
         type_label = {
             "exact": "Exact text",
@@ -1197,7 +1732,7 @@ def review_requirements(payload: dict[str, Any]) -> dict[str, Any]:
             {
                 "line": index,
                 "requirement": type_label,
-                "status": "PASS" if passed else "FAIL",
+                "status": "PASS" if passed else "NEEDS REVIEW" if recheck_passed else "FAIL",
                 "expected": expected_display,
                 "observed": observed,
                 "rechecked": rechecked,
@@ -1230,66 +1765,11 @@ def correction_key(row: int, original: str) -> str:
 def apply_corrections(grid: list[list[str]]) -> list[list[str]]:
     corrections = load_corrections()
     updated = [[cell for cell in row] for row in grid]
-    legacy_corrections = {
-        key: value
-        for key, value in corrections.items()
-        if not key.startswith("row:") and not key.startswith("image:")
-    }
-    compact_corrections = {
-        compact_row_text(key): value for key, value in legacy_corrections.items() if compact_row_text(key)
-    }
     for row_index, row in enumerate(updated):
         row_text = fixed_row_text("".join(cell or " " for cell in row))
         exact_key = correction_key(row_index, row_text)
         if exact_key in corrections:
             updated[row_index] = list(fixed_row_text(corrections[exact_key]))
-            continue
-
-        normalized = re.sub(r"\s+", " ", row_text).strip()
-        row_prefix = f"row:{row_index + 1}|"
-        row_candidates = {
-            key[len(row_prefix) :]: value for key, value in corrections.items() if key.startswith(row_prefix)
-        }
-        normalized_candidates = {
-            re.sub(r"\s+", " ", key).strip(): value for key, value in row_candidates.items()
-        }
-        if normalized in normalized_candidates:
-            corrected = fixed_row_text(normalized_candidates[normalized])
-            updated[row_index] = list(corrected)
-            continue
-
-        if normalized in legacy_corrections:
-            corrected = fixed_row_text(legacy_corrections[normalized])
-            updated[row_index] = list(corrected)
-            continue
-
-        compact = compact_row_text(row_text)
-        row_compact = {
-            compact_row_text(key): value for key, value in row_candidates.items() if compact_row_text(key)
-        }
-        if compact in row_compact:
-            updated[row_index] = list(fixed_row_text(row_compact[compact]))
-            continue
-
-        if compact in compact_corrections:
-            corrected = fixed_row_text(compact_corrections[compact])
-            updated[row_index] = list(corrected)
-            continue
-
-        if len(compact) >= 4:
-            best_key = ""
-            best_ratio = 0.0
-            candidates = row_compact or compact_corrections
-            for key in candidates:
-                if abs(len(key) - len(compact)) > 4:
-                    continue
-                ratio = difflib.SequenceMatcher(None, compact, key).ratio()
-                if ratio > best_ratio:
-                    best_key = key
-                    best_ratio = ratio
-            if best_key and best_ratio >= 0.86:
-                corrected = fixed_row_text(candidates[best_key])
-                updated[row_index] = list(corrected)
     return normalize_grid_guards(updated)
 
 
@@ -1318,7 +1798,7 @@ def apply_templates(grid: list[list[str]], warped: Image.Image) -> list[list[str
                 continue
             char, distance = classified
             current = updated[row][col]
-            if not current or (current in {"O", "0"} and char in {"O", "0"}) or distance <= 0.14:
+            if not current or (current in {"O", "0"} and char in {"O", "0"} and distance <= 0.10):
                 updated[row][col] = char
     return updated
 
@@ -1408,6 +1888,19 @@ def recover_dash_lines(grid: list[list[str]], warped: Image.Image) -> list[list[
     cell_h = screen_h / ROWS
 
     for row in range(ROWS):
+        existing_dash_cols = [
+            col for col in range(FIRST_DATA_COL, LAST_DATA_COL + 1) if updated[row][col] == "-"
+        ]
+        if len(existing_dash_cols) >= 12:
+            start = min(existing_dash_cols)
+            end = max(existing_dash_cols)
+            non_dash = sum(
+                1 for col in range(start, end + 1) if updated[row][col] and updated[row][col] != "-"
+            )
+            if non_dash <= 3:
+                for col in range(start, end + 1):
+                    updated[row][col] = "-"
+
         y1 = int((row + 0.38) * cell_h)
         y2 = int((row + 0.68) * cell_h)
         if y2 <= y1:
@@ -1417,6 +1910,7 @@ def recover_dash_lines(grid: list[list[str]], warped: Image.Image) -> list[list[
             continue
 
         active_cols: list[int] = []
+        relaxed_dash_cols: list[int] = []
         for col in range(FIRST_DATA_COL, LAST_DATA_COL + 1):
             x1 = int(col * cell_w + cell_w * 0.10)
             x2 = int((col + 1) * cell_w - cell_w * 0.10)
@@ -1428,6 +1922,8 @@ def recover_dash_lines(grid: list[list[str]], warped: Image.Image) -> list[list[
             row_stroke = float(np.max(np.mean(bright, axis=1)))
             if 0.006 <= bright_ratio <= 0.16 and row_stroke >= 0.34:
                 active_cols.append(col)
+            if 0.006 <= bright_ratio <= 0.30 and row_stroke >= 0.55:
+                relaxed_dash_cols.append(col)
 
         run_start: int | None = None
         runs: list[tuple[int, int]] = []
@@ -1445,11 +1941,39 @@ def recover_dash_lines(grid: list[list[str]], warped: Image.Image) -> list[list[
             # Avoid turning a text-heavy row into dashes. Separator rows normally have
             # long mostly empty spans with only a few labels at the edges.
             occupied = sum(1 for col in range(start, end + 1) if updated[row][col])
+            dash_count = sum(1 for col in range(start, end + 1) if updated[row][col] == "-")
+            non_dash_count = occupied - dash_count
+            if end - start + 1 >= 12 and dash_count >= 6 and non_dash_count <= 3:
+                for col in range(start, end + 1):
+                    updated[row][col] = "-"
+                continue
             if occupied > max(3, (end - start + 1) // 4):
                 continue
             for col in range(start, end + 1):
                 if not updated[row][col]:
                     updated[row][col] = "-"
+
+        current_dash_count = sum(
+            updated[row][col] == "-" for col in range(FIRST_DATA_COL, LAST_DATA_COL + 1)
+        )
+        if current_dash_count >= 12 and len(relaxed_dash_cols) >= 12:
+            relaxed_start = min(relaxed_dash_cols)
+            relaxed_end = max(relaxed_dash_cols)
+            for col in range(relaxed_start, relaxed_end + 1):
+                updated[row][col] = "-"
+
+    # A row may become dash-dominant only after the image pass fills missed cells.
+    # Normalize once more so isolated OCR punctuation cannot survive inside it.
+    for row in range(ROWS):
+        dash_cols = [col for col in range(FIRST_DATA_COL, LAST_DATA_COL + 1) if updated[row][col] == "-"]
+        if len(dash_cols) < 12:
+            continue
+        start = min(dash_cols)
+        end = max(dash_cols)
+        non_dash = sum(1 for col in range(start, end + 1) if updated[row][col] and updated[row][col] != "-")
+        if non_dash <= 3:
+            for col in range(start, end + 1):
+                updated[row][col] = "-"
     return normalize_grid_guards(updated)
 
 
@@ -1457,10 +1981,13 @@ def remember_templates(payload: dict[str, Any]) -> dict[str, Any]:
     image = load_image(str(payload["image"]))
     corners = payload.get("corners")
     grid = payload.get("grid")
+    source_grid = payload.get("sourceGrid")
     if not isinstance(corners, list) or len(corners) != 4:
         raise ValueError("Four screen corners are required for template learning.")
     if not isinstance(grid, list) or len(grid) != ROWS:
         raise ValueError("A corrected 13-row grid is required for template learning.")
+    if not isinstance(source_grid, list) or len(source_grid) != ROWS:
+        raise ValueError("The original OCR grid is required for selective template learning.")
 
     warped = warp_screen(image, corners)
     templates = load_templates()
@@ -1472,6 +1999,11 @@ def remember_templates(payload: dict[str, Any]) -> dict[str, Any]:
             if col_index < FIRST_DATA_COL or col_index > LAST_DATA_COL:
                 continue
             char = clean_ocr_text(str(value))[:1]
+            original = ""
+            if isinstance(source_grid[row_index], list) and col_index < len(source_grid[row_index]):
+                original = clean_ocr_text(str(source_grid[row_index][col_index]))[:1]
+            if char == original:
+                continue
             if not char or char.isspace():
                 continue
             templates.setdefault(char, []).append(cell_feature(warped, row_index, col_index))
@@ -1487,19 +2019,64 @@ def analyze(payload: dict[str, Any]) -> dict[str, Any]:
         raise ValueError("Four screen corners are required.")
 
     warped = warp_screen(image, corners)
-    processed = preprocess_for_ocr(warped)
     screen_size = warped.size
+    ocr_candidates: list[tuple[float, str, Image.Image, list[dict[str, Any]]]] = []
+    for variant_name, variant_image in preprocessing_variants(warped):
+        variant_words = run_tesseract_tsv(variant_image)
+        ocr_candidates.append(
+            (ocr_words_score(variant_words, variant_image.height), variant_name, variant_image, variant_words)
+        )
+    _, preprocessing_name, processed, words = max(ocr_candidates, key=lambda item: item[0])
     boxes = run_tesseract_boxes(processed)
-    words = run_tesseract_tsv(processed)
     geometry = calibrate_grid(boxes, screen_size)
 
-    grid = empty_grid()
-    word_scores = [[0.0 for _ in range(COLS)] for _ in range(ROWS)]
-    for word in words:
-        place_word(grid, word_scores, word, geometry)
-    if grid_character_count(grid) < 8:
-        for box in boxes:
-            place_char(grid, box, geometry)
+    word_candidates: list[tuple[str, list[list[str]], list[list[float]]]] = []
+    for _, variant_name, _, variant_words in ocr_candidates:
+        candidate_grid = empty_grid()
+        candidate_scores = [[0.0 for _ in range(COLS)] for _ in range(ROWS)]
+        candidate_confidence = empty_confidence_grid()
+        for word in variant_words:
+            place_word(candidate_grid, candidate_scores, candidate_confidence, word, geometry)
+        word_candidates.append((variant_name, candidate_grid, candidate_confidence))
+
+    hybrid_requested = bool(payload.get("hybridOcr", True))
+    paddle_words: list[dict[str, Any]] = []
+    paddle_error = ""
+    paddle_grid = empty_grid()
+    paddle_confidence = empty_confidence_grid()
+    if hybrid_requested:
+        paddle_words, paddle_error = run_paddle_ocr(warped)
+        if paddle_words:
+            paddle_scores = [[0.0 for _ in range(COLS)] for _ in range(ROWS)]
+            for word in paddle_words:
+                place_word(paddle_grid, paddle_scores, paddle_confidence, word, geometry)
+
+    word_grid = empty_grid()
+    word_confidence = empty_confidence_grid()
+    row_sources: list[str] = []
+    for row in range(ROWS):
+        def row_candidate_score(candidate: tuple[str, list[list[str]], list[list[float]]]) -> float:
+            _, candidate_grid, candidate_confidence = candidate
+            text = row_string_from_cells(candidate_grid[row])
+            confidence_score = sum(candidate_confidence[row][FIRST_DATA_COL : LAST_DATA_COL + 1])
+            character_count = sum(bool(cell) for cell in candidate_grid[row][FIRST_DATA_COL : LAST_DATA_COL + 1])
+            return mcdu_row_score(text) + confidence_score * 2.0 + character_count * 0.5
+
+        source_name, source_grid, source_confidence = max(word_candidates, key=row_candidate_score)
+        word_grid[row] = source_grid[row][:]
+        word_confidence[row] = source_confidence[row][:]
+        row_sources.append(source_name)
+
+    fusion_summary = None
+    if paddle_words:
+        word_grid, word_confidence, fusion_summary = fuse_engine_grids(
+            word_grid,
+            word_confidence,
+            paddle_grid,
+            paddle_confidence,
+        )
+    char_grid, char_confidence = build_character_grid(boxes, geometry)
+    grid, confidence_grid = merge_ocr_grids(word_grid, word_confidence, char_grid, char_confidence)
     grid = recover_dash_lines(grid, warped)
     grid = apply_templates(grid, warped)
     grid = disambiguate_o_zero(grid)
@@ -1522,6 +2099,16 @@ def analyze(payload: dict[str, Any]) -> dict[str, Any]:
         "words": words,
         "boxes": boxes,
         "calibration": geometry,
+        "confidenceGrid": confidence_grid,
+        "preprocessing": preprocessing_name,
+        "rowPreprocessing": row_sources,
+        "ocrEngines": {
+            "requested": ["tesseract", "paddle"] if hybrid_requested else ["tesseract"],
+            "used": ["tesseract", "paddle"] if paddle_words else ["tesseract"],
+            "paddleWords": len(paddle_words),
+            "paddleError": paddle_error,
+            "fusion": fusion_summary,
+        },
         "previewUrl": f"/data/exports/{preview_id}",
         "verification": verification_summary,
     }
@@ -1577,7 +2164,7 @@ def export_docx(payload: dict[str, Any]) -> dict[str, str]:
                 for run in paragraph.runs:
                     run.font.size = Pt(7)
 
-    filename = f"mcmdu-grid-{uuid.uuid4().hex[:8]}.docx"
+    filename = f"mcdu-grid-{uuid.uuid4().hex[:8]}.docx"
     path = EXPORTS / filename
     document.save(path)
     return {"url": f"/data/exports/{filename}", "filename": filename}
@@ -1643,10 +2230,13 @@ class McmduHandler(SimpleHTTPRequestHandler):
     def translate_path(self, path: str) -> str:
         parsed = urlparse(path).path
         if parsed.startswith("/data/exports/"):
-            return str((ROOT / parsed.lstrip("/")).resolve())
+            return str((EXPORTS / Path(parsed).name).resolve())
         if parsed == "/":
             return str(STATIC / "index.html")
-        return str((STATIC / parsed.lstrip("/")).resolve())
+        filename = Path(parsed).name
+        if filename not in {"index.html", "app.js", "styles.css"}:
+            return str((STATIC / "__not_found__").resolve())
+        return str((STATIC / filename).resolve())
 
     def do_POST(self) -> None:
         try:
