@@ -776,7 +776,7 @@ rememberButton.addEventListener("click", async () => {
       grid: current,
     });
     state.sourceGrid = current;
-    setStatus(`Reusable corrections saved, ${learned.learned} character samples learned`);
+    setStatus(`Reusable corrections saved, ${learned.learned} visual samples learned`);
   } catch (error) {
     setStatus(error.message);
   } finally {

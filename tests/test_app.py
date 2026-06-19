@@ -5,6 +5,7 @@ from unittest.mock import patch
 
 import app
 import numpy as np
+from PIL import ImageDraw
 
 
 def grid_with_row(text: str, row: int = 0) -> list[list[str]]:
@@ -101,6 +102,17 @@ class OcrMergeTests(unittest.TestCase):
         self.assertEqual(merged[0][37], ">")
         self.assertEqual(merged[0][38], "")
 
+    def test_character_merge_rejects_standalone_dash_and_arrow(self) -> None:
+        words = app.empty_grid()
+        word_confidence = app.empty_confidence_grid()
+        chars = app.empty_grid()
+        char_confidence = app.empty_confidence_grid()
+        chars[0][4], char_confidence[0][4] = "-", 0.8
+        chars[1][10], char_confidence[1][10] = ">", 0.8
+        merged, _ = app.merge_ocr_grids(words, word_confidence, chars, char_confidence)
+        self.assertEqual(merged[0][4], "")
+        self.assertEqual(merged[1][10], "")
+
     def test_hybrid_fusion_rewards_agreement_and_marks_conflicts(self) -> None:
         primary = app.empty_grid()
         primary_confidence = app.empty_confidence_grid()
@@ -176,6 +188,16 @@ class OcrMergeTests(unittest.TestCase):
         recovered = app.recover_dash_lines(grid, image)
         self.assertTrue(all(recovered[9][col] == "-" for col in range(1, 35)))
 
+    def test_dash_recovery_does_not_fill_between_text_blocks(self) -> None:
+        grid = app.empty_grid()
+        grid[0][2] = "A"
+        grid[0][35] = "B"
+        image = app.Image.new("RGB", (1600, 1300), "black")
+        draw = ImageDraw.Draw(image)
+        draw.line((10 * 40, 50, 31 * 40, 50), fill="white", width=5)
+        recovered = app.recover_dash_lines(grid, image)
+        self.assertFalse(any(recovered[0][col] == "-" for col in range(3, 35)))
+
     def test_balanced_recheck_does_not_fill_intentional_word_spacing(self) -> None:
         grid = app.empty_grid()
         grid[0][5] = "A"
@@ -211,6 +233,70 @@ class TemplateLearningTests(unittest.TestCase):
         self.assertEqual(result["learned"], 1)
         saved_templates = save.call_args.args[0]
         self.assertEqual(set(saved_templates), {"D"})
+
+    def test_deleted_dash_learns_a_blank_visual_template(self) -> None:
+        source = grid_with_row(" -")
+        corrected = grid_with_row("")
+        with (
+            patch.object(app, "load_image"),
+            patch.object(app, "warp_screen"),
+            patch.object(app, "cell_feature", return_value=[1.0]),
+            patch.object(app, "load_templates", return_value={}),
+            patch.object(app, "save_templates") as save,
+        ):
+            result = app.remember_templates(
+                {"image": "unused", "corners": [{}, {}, {}, {}], "sourceGrid": source, "grid": corrected}
+            )
+        self.assertEqual(result["learned"], 1)
+        self.assertEqual(set(save.call_args.args[0]), {app.BLANK_TEMPLATE_KEY})
+
+    def test_blank_template_removes_only_a_predicted_dash(self) -> None:
+        grid = app.empty_grid()
+        grid[0][1] = "-"
+        grid[0][2] = "A"
+        image = app.Image.new("RGB", (1600, 1300), "black")
+        with (
+            patch.object(app, "load_templates", return_value={app.BLANK_TEMPLATE_KEY: [[1.0]]}),
+            patch.object(app, "classify_from_templates", return_value=(app.BLANK_TEMPLATE_KEY, 0.05)),
+            patch.object(app, "cell_feature", return_value=[1.0]),
+        ):
+            result = app.apply_templates(grid, image)
+        self.assertEqual(result[0][1], "")
+        self.assertEqual(result[0][2], "A")
+
+    def test_dash_template_cannot_generate_content_in_a_blank_cell(self) -> None:
+        grid = app.empty_grid()
+        image = app.Image.new("RGB", (1600, 1300), "white")
+        with (
+            patch.object(app, "load_templates", return_value={"-": [[1.0]]}),
+            patch.object(app, "classify_from_templates", return_value=("-", 0.01)),
+            patch.object(app, "cell_feature", return_value=[1.0]),
+        ):
+            result = app.apply_templates(grid, image)
+        self.assertEqual(result[0][1], "")
+
+    def test_blank_template_key_survives_reload(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "templates.json"
+            path.write_text('{"__BLANK__": [[1.0]], "A": [[2.0]]}', encoding="utf-8")
+            with patch.object(app, "TEMPLATES", path):
+                templates = app.load_templates()
+        self.assertEqual(set(templates), {app.BLANK_TEMPLATE_KEY, "A"})
+
+
+class BlankCorrectionTests(unittest.TestCase):
+    def test_completely_blank_corrected_row_is_saved(self) -> None:
+        source = grid_with_row(" ----------", row=11)
+        corrected = app.empty_grid()
+        with (
+            patch.object(app, "load_corrections", return_value={}),
+            patch.object(app, "save_corrections") as save,
+        ):
+            result = app.remember_grid({"sourceGrid": source, "grid": corrected})
+        self.assertEqual(result["saved"], 1)
+        saved = save.call_args.args[0]
+        self.assertEqual(len(saved), 1)
+        self.assertFalse(next(iter(saved.values())).strip())
 
 
 if __name__ == "__main__":

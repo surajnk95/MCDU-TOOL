@@ -35,6 +35,7 @@ DATA = ROOT / "data"
 EXPORTS = DATA / "exports"
 CORRECTIONS = DATA / "corrections.json"
 TEMPLATES = DATA / "templates.json"
+BLANK_TEMPLATE_KEY = "__BLANK__"
 
 ROWS = 13
 COLS = 40
@@ -339,7 +340,8 @@ def load_templates() -> dict[str, list[list[float]]]:
             continue
         if not isinstance(features, list):
             continue
-        templates[char[:1]] = [feature for feature in features if isinstance(feature, list)]
+        key = char if char == BLANK_TEMPLATE_KEY else char[:1]
+        templates[key] = [feature for feature in features if isinstance(feature, list)]
     return templates
 
 
@@ -1068,9 +1070,12 @@ def merge_ocr_grids(
                     word_grid[row][nearby_col]
                     for nearby_col in range(col + 1, min(LAST_DATA_COL, col + 2) + 1)
                 )
-                if (char in {"<", ">", "°", "-"} and not same_nearby) or (
-                    left_context and right_context and not same_nearby
-                ):
+                adjacent = "".join(
+                    word_grid[row][nearby_col] or " "
+                    for nearby_col in range(max(FIRST_DATA_COL, col - 1), min(LAST_DATA_COL, col + 1) + 1)
+                )
+                degree_context = char == "°" and any(value.isdigit() for value in adjacent)
+                if degree_context or (left_context and right_context and not same_nearby):
                     merged[row][col] = char
                     confidence[row][col] = min(char_confidence[row][col], 0.72)
             elif word:
@@ -1789,7 +1794,8 @@ def apply_templates(grid: list[list[str]], warped: Image.Image) -> list[list[str
             y1 = int(row * cell_h)
             y2 = int((row + 1) * cell_h)
             crop = gray[y1:y2, x1:x2]
-            if crop.size == 0 or float(crop.max()) < 105:
+            current = updated[row][col]
+            if crop.size == 0 or (float(crop.max()) < 105 and current != "-"):
                 continue
             if col < FIRST_DATA_COL or col > LAST_DATA_COL:
                 continue
@@ -1797,7 +1803,12 @@ def apply_templates(grid: list[list[str]], warped: Image.Image) -> list[list[str
             if not classified:
                 continue
             char, distance = classified
-            current = updated[row][col]
+            if char == BLANK_TEMPLATE_KEY:
+                if current == "-" and distance <= 0.10:
+                    updated[row][col] = ""
+                continue
+            if not current and char in {"-", "<", ">", ".", "/"}:
+                continue
             if not current or (current in {"O", "0"} and char in {"O", "0"} and distance <= 0.10):
                 updated[row][col] = char
     return updated
@@ -1901,8 +1912,8 @@ def recover_dash_lines(grid: list[list[str]], warped: Image.Image) -> list[list[
                 for col in range(start, end + 1):
                     updated[row][col] = "-"
 
-        y1 = int((row + 0.38) * cell_h)
-        y2 = int((row + 0.68) * cell_h)
+        y1 = int((row + 0.25) * cell_h)
+        y2 = int((row + 0.80) * cell_h)
         if y2 <= y1:
             continue
         strip = gray[max(0, y1) : min(screen_h, y2), :]
@@ -1922,7 +1933,7 @@ def recover_dash_lines(grid: list[list[str]], warped: Image.Image) -> list[list[
             row_stroke = float(np.max(np.mean(bright, axis=1)))
             if 0.006 <= bright_ratio <= 0.16 and row_stroke >= 0.34:
                 active_cols.append(col)
-            if 0.006 <= bright_ratio <= 0.30 and row_stroke >= 0.55:
+            if 0.003 <= bright_ratio <= 0.30 and row_stroke >= 0.45:
                 relaxed_dash_cols.append(col)
 
         run_start: int | None = None
@@ -1940,6 +1951,14 @@ def recover_dash_lines(grid: list[list[str]], warped: Image.Image) -> list[list[
         for start, end in runs:
             # Avoid turning a text-heavy row into dashes. Separator rows normally have
             # long mostly empty spans with only a few labels at the edges.
+            has_text_left = any(
+                str(updated[row][col]).isalpha() for col in range(FIRST_DATA_COL, start)
+            )
+            has_text_right = any(
+                str(updated[row][col]).isalpha() for col in range(end + 1, LAST_DATA_COL + 1)
+            )
+            if has_text_left and has_text_right:
+                continue
             occupied = sum(1 for col in range(start, end + 1) if updated[row][col])
             dash_count = sum(1 for col in range(start, end + 1) if updated[row][col] == "-")
             non_dash_count = occupied - dash_count
@@ -2005,6 +2024,11 @@ def remember_templates(payload: dict[str, Any]) -> dict[str, Any]:
             if char == original:
                 continue
             if not char or char.isspace():
+                if original == "-":
+                    templates.setdefault(BLANK_TEMPLATE_KEY, []).append(
+                        cell_feature(warped, row_index, col_index)
+                    )
+                    learned += 1
                 continue
             templates.setdefault(char, []).append(cell_feature(warped, row_index, col_index))
             learned += 1
@@ -2182,7 +2206,7 @@ def remember(payload: dict[str, Any]) -> dict[str, Any]:
     corrected_list[0] = " "
     corrected_list[COLS - 1] = " "
     corrected = "".join(corrected_list)
-    if not corrected.strip():
+    if original == corrected:
         return {"count": len(load_corrections()), "skipped": True}
 
     corrections = load_corrections()
@@ -2205,8 +2229,7 @@ def remember_grid(payload: dict[str, Any]) -> dict[str, Any]:
         corrected = grid_row_from_payload(corrected_grid, row)
         if original == corrected:
             continue
-        if corrected.strip():
-            corrections[correction_key(row, original)] = corrected
+        corrections[correction_key(row, original)] = corrected
         saved += 1
     save_corrections(corrections)
     return {"count": len(corrections), "saved": saved}
