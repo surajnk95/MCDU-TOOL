@@ -164,10 +164,31 @@ function lerpPoint(a, b, t) {
   return { x: lerp(a.x, b.x, t), y: lerp(a.y, b.y, t) };
 }
 
-function bilinear(corners, u, v) {
-  const top = lerpPoint(corners[0], corners[1], u);
-  const bottom = lerpPoint(corners[3], corners[2], u);
-  return lerpPoint(top, bottom, v);
+function projectPoint(corners, u, v) {
+  const [topLeft, topRight, bottomRight, bottomLeft] = corners;
+  const dx1 = topRight.x - bottomRight.x;
+  const dx2 = bottomLeft.x - bottomRight.x;
+  const dx3 = topLeft.x - topRight.x + bottomRight.x - bottomLeft.x;
+  const dy1 = topRight.y - bottomRight.y;
+  const dy2 = bottomLeft.y - bottomRight.y;
+  const dy3 = topLeft.y - topRight.y + bottomRight.y - bottomLeft.y;
+  const denominator = dx1 * dy2 - dx2 * dy1;
+
+  let g = 0;
+  let h = 0;
+  if (Math.abs(denominator) > 1e-8) {
+    g = (dx3 * dy2 - dx2 * dy3) / denominator;
+    h = (dx1 * dy3 - dx3 * dy1) / denominator;
+  }
+  const a = topRight.x - topLeft.x + g * topRight.x;
+  const b = bottomLeft.x - topLeft.x + h * bottomLeft.x;
+  const d = topRight.y - topLeft.y + g * topRight.y;
+  const e = bottomLeft.y - topLeft.y + h * bottomLeft.y;
+  const scale = g * u + h * v + 1;
+  return {
+    x: (a * u + b * v + topLeft.x) / scale,
+    y: (d * u + e * v + topLeft.y) / scale,
+  };
 }
 
 function getInsetValues() {
@@ -186,10 +207,10 @@ function getGridCorners() {
   const v1 = inset.top;
   const v2 = 1 - inset.bottom;
   return [
-    bilinear(state.corners, u1, v1),
-    bilinear(state.corners, u2, v1),
-    bilinear(state.corners, u2, v2),
-    bilinear(state.corners, u1, v2),
+    projectPoint(state.corners, u1, v1),
+    projectPoint(state.corners, u2, v1),
+    projectPoint(state.corners, u2, v2),
+    projectPoint(state.corners, u1, v2),
   ];
 }
 
@@ -242,8 +263,8 @@ function drawGrid() {
 
   for (let col = 0; col <= COLS; col += 1) {
     const u = col / COLS;
-    const top = bilinear(corners, u, 0);
-    const bottom = bilinear(corners, u, 1);
+    const top = projectPoint(corners, u, 0);
+    const bottom = projectPoint(corners, u, 1);
     ctx.beginPath();
     ctx.moveTo(top.x, top.y);
     ctx.lineTo(bottom.x, bottom.y);
@@ -252,8 +273,8 @@ function drawGrid() {
 
   for (let row = 0; row <= ROWS; row += 1) {
     const v = row / ROWS;
-    const left = bilinear(corners, 0, v);
-    const right = bilinear(corners, 1, v);
+    const left = projectPoint(corners, 0, v);
+    const right = projectPoint(corners, 1, v);
     ctx.beginPath();
     ctx.moveTo(left.x, left.y);
     ctx.lineTo(right.x, right.y);
@@ -262,12 +283,12 @@ function drawGrid() {
 
   ctx.fillStyle = "rgba(6, 79, 73, 0.9)";
   for (let row = 0; row < ROWS; row += 1) {
-    const p = bilinear(corners, -0.035, (row + 0.5) / ROWS);
+    const p = projectPoint(corners, -0.035, (row + 0.5) / ROWS);
     ctx.fillText(String(row + 1), p.x, p.y);
   }
 
   for (let col = 1; col <= 38; col += 1) {
-    const p = bilinear(corners, (col + 0.5) / COLS, -0.035);
+    const p = projectPoint(corners, (col + 0.5) / COLS, -0.035);
     ctx.fillText(String(col), p.x, p.y);
   }
   ctx.restore();
@@ -515,7 +536,8 @@ async function autoDetectDisplay() {
       });
       draw();
       const size = result.displaySize ? ` ${result.displaySize.width}x${result.displaySize.height}` : "";
-      setStatus(`Display detected${size}`);
+      const method = result.perspectiveRefined ? "Perspective display detected" : "Display detected";
+      setStatus(`${method}${size}`);
       await flattenDisplay(false);
       return true;
     }

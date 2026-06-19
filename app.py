@@ -1266,6 +1266,136 @@ def regularize_quadrilateral(points: list[tuple[float, float]]) -> list[tuple[fl
     return points
 
 
+def polygon_area(points: list[tuple[float, float]]) -> float:
+    return 0.5 * abs(
+        sum(
+            points[index][0] * points[(index + 1) % len(points)][1]
+            - points[(index + 1) % len(points)][0] * points[index][1]
+            for index in range(len(points))
+        )
+    )
+
+
+def line_intersection(
+    first: tuple[float, float, float],
+    second: tuple[float, float, float],
+) -> tuple[float, float] | None:
+    a1, b1, c1 = first
+    a2, b2, c2 = second
+    denominator = a1 * b2 - a2 * b1
+    if abs(denominator) < 1e-6:
+        return None
+    return (
+        (b1 * c2 - b2 * c1) / denominator,
+        (c1 * a2 - c2 * a1) / denominator,
+    )
+
+
+def segment_line(segment: np.ndarray) -> tuple[float, float, float]:
+    x1, y1, x2, y2 = (float(value) for value in segment)
+    a = y1 - y2
+    b = x2 - x1
+    length = max(1e-6, math.hypot(a, b))
+    return a / length, b / length, (x1 * y2 - x2 * y1) / length
+
+
+def refine_display_corners(
+    image: Image.Image,
+    corners: list[dict[str, float]],
+) -> list[dict[str, float]]:
+    """Snap a rough dark-region box to the four physical display border lines."""
+    try:
+        import cv2
+    except (ImportError, OSError):
+        return corners
+
+    if len(corners) != 4:
+        return corners
+    points = np.asarray([[corner["x"], corner["y"]] for corner in corners], dtype=np.float32)
+    gray = cv2.cvtColor(np.asarray(image), cv2.COLOR_RGB2GRAY)
+    gray = cv2.GaussianBlur(gray, (5, 5), 0)
+    edges = cv2.Canny(gray, 35, 115)
+
+    widths = [float(np.linalg.norm(points[1] - points[0])), float(np.linalg.norm(points[2] - points[3]))]
+    heights = [float(np.linalg.norm(points[3] - points[0])), float(np.linalg.norm(points[2] - points[1]))]
+    min_edge = max(30.0, min(widths + heights))
+    lines = cv2.HoughLinesP(
+        edges,
+        1,
+        np.pi / 720,
+        threshold=max(35, int(min_edge * 0.13)),
+        minLineLength=max(25, int(min_edge * 0.32)),
+        maxLineGap=max(8, int(min_edge * 0.05)),
+    )
+    if lines is None:
+        return corners
+
+    # Bottom and left use reversed endpoints so every expected side follows the
+    # clockwise display outline. Direction itself is ignored during matching.
+    expected = [
+        (points[0], points[1], sum(heights) * 0.5),
+        (points[1], points[2], sum(widths) * 0.5),
+        (points[3], points[2], sum(heights) * 0.5),
+        (points[0], points[3], sum(widths) * 0.5),
+    ]
+    selected: list[tuple[float, float, float]] = []
+    for start, end, opposite_size in expected:
+        vector = end - start
+        expected_length = float(np.linalg.norm(vector))
+        if expected_length < 20:
+            return corners
+        unit = vector / expected_length
+        normal = np.asarray([-unit[1], unit[0]], dtype=np.float32)
+        tolerance = max(8.0, opposite_size * 0.085)
+        best: tuple[float, np.ndarray] | None = None
+        for raw_segment in lines[:, 0]:
+            segment = raw_segment.astype(np.float32)
+            segment_vector = segment[2:4] - segment[0:2]
+            segment_length = float(np.linalg.norm(segment_vector))
+            if segment_length < expected_length * 0.24:
+                continue
+            segment_unit = segment_vector / max(1e-6, segment_length)
+            angle = math.degrees(math.acos(min(1.0, abs(float(np.dot(unit, segment_unit))))))
+            if angle > 13.0:
+                continue
+            midpoint = (segment[0:2] + segment[2:4]) * 0.5
+            along = float(np.dot(midpoint - start, unit))
+            if along < -expected_length * 0.16 or along > expected_length * 1.16:
+                continue
+            distance = abs(float(np.dot(midpoint - start, normal)))
+            if distance > tolerance:
+                continue
+            coverage = min(1.0, segment_length / expected_length)
+            score = distance / tolerance + angle / 13.0 - coverage * 0.62
+            if best is None or score < best[0]:
+                best = (score, segment)
+        if best is None:
+            return corners
+        selected.append(segment_line(best[1]))
+
+    top, right, bottom, left = selected
+    intersections = [
+        line_intersection(left, top),
+        line_intersection(top, right),
+        line_intersection(right, bottom),
+        line_intersection(bottom, left),
+    ]
+    if any(point is None for point in intersections):
+        return corners
+    refined = [point for point in intersections if point is not None]
+    rough = [(float(point[0]), float(point[1])) for point in points]
+    rough_area = max(1.0, polygon_area(rough))
+    refined_area = polygon_area(refined)
+    max_shift = max(max(widths), max(heights)) * 0.13
+    if not (rough_area * 0.70 <= refined_area <= rough_area * 1.30):
+        return corners
+    if any(math.dist(old, new) > max_shift for old, new in zip(rough, refined)):
+        return corners
+    if any(x < 0 or y < 0 or x >= image.width or y >= image.height for x, y in refined):
+        return corners
+    return [{"x": float(x), "y": float(y)} for x, y in refined]
+
+
 def component_corners(component: dict[str, Any], scale: float) -> list[dict[str, float]]:
     x1 = float(component["x1"])
     y1 = float(component["y1"])
@@ -1398,11 +1528,20 @@ def detect_display(payload: dict[str, Any]) -> dict[str, Any]:
     corner_component = dict(best)
     corner_component.update({"x1": x1, "y1": y1, "x2": x2, "y2": y2})
     corners = component_corners(corner_component, scale)
+    small_corners = [{"x": corner["x"] * scale, "y": corner["y"] * scale} for corner in corners]
+    refined_small = refine_display_corners(small, small_corners)
+    perspective_refined = any(
+        edge_length(before, after) > 1.5 for before, after in zip(small_corners, refined_small)
+    )
+    corners = [{"x": corner["x"] / scale, "y": corner["y"] / scale} for corner in refined_small]
+    display_width = (edge_length(corners[0], corners[1]) + edge_length(corners[3], corners[2])) * 0.5
+    display_height = (edge_length(corners[0], corners[3]) + edge_length(corners[1], corners[2])) * 0.5
     inv = 1 / scale
     return {
         "corners": corners,
         "confidence": round(float(best["fill"]), 3),
-        "displaySize": {"width": round((x2 - x1) * inv), "height": round((y2 - y1) * inv)},
+        "perspectiveRefined": perspective_refined,
+        "displaySize": {"width": round(display_width), "height": round(display_height)},
     }
 
 

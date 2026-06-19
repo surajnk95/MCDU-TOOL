@@ -1,3 +1,4 @@
+import math
 import tempfile
 import unittest
 from pathlib import Path
@@ -31,6 +32,26 @@ class OcrNormalizationTests(unittest.TestCase):
 
 
 class DisplayGeometryTests(unittest.TestCase):
+    def test_border_lines_refine_a_skewed_phone_photo(self) -> None:
+        try:
+            import cv2  # noqa: F401
+        except ImportError:
+            self.skipTest("OpenCV is optional at runtime")
+        image = app.Image.new("RGB", (800, 600), (130, 130, 130))
+        draw = ImageDraw.Draw(image)
+        expected = [(130, 100), (690, 125), (650, 500), (100, 470)]
+        draw.polygon(expected, fill=(5, 5, 5))
+        draw.line(expected + [expected[0]], fill=(235, 235, 235), width=7, joint="curve")
+        rough = [
+            {"x": 100.0, "y": 100.0},
+            {"x": 690.0, "y": 100.0},
+            {"x": 690.0, "y": 500.0},
+            {"x": 100.0, "y": 500.0},
+        ]
+        refined = app.refine_display_corners(image, rough)
+        for actual, target in zip(refined, expected):
+            self.assertLess(math.dist((actual["x"], actual["y"]), target), 7.0)
+
     def test_collapsed_bottom_left_corner_is_reconstructed(self) -> None:
         points = [(316.0, 317.0), (2426.0, 316.0), (2404.0, 1945.0), (637.0, 1944.0)]
         corrected = app.regularize_quadrilateral(points)
