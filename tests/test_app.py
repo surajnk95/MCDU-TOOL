@@ -32,6 +32,25 @@ class OcrNormalizationTests(unittest.TestCase):
 
 
 class DisplayGeometryTests(unittest.TestCase):
+    def test_grid_origin_moves_boundaries_into_character_gaps(self) -> None:
+        image = app.Image.new("RGB", (800, 260), "black")
+        draw = ImageDraw.Draw(image)
+        target_x = -6.0
+        target_y = 3.0
+        cell_w = image.width / app.COLS
+        cell_h = image.height / app.ROWS
+        for row in range(app.ROWS):
+            for col in range(1, app.COLS - 1, 3):
+                center_x = target_x + (col + 0.5) * cell_w
+                center_y = target_y + (row + 0.5) * cell_h
+                draw.rectangle(
+                    (center_x - 8, center_y - 8, center_x + 8, center_y + 8),
+                    fill="white",
+                )
+        origin_x, origin_y = app.estimate_grid_origin(image)
+        self.assertAlmostEqual(origin_x, target_x, delta=1.5)
+        self.assertAlmostEqual(origin_y, target_y, delta=1.5)
+
     def test_border_lines_refine_a_skewed_phone_photo(self) -> None:
         try:
             import cv2  # noqa: F401
@@ -72,6 +91,11 @@ class DisplayGeometryTests(unittest.TestCase):
         geometry = app.calibrate_grid(boxes, (1600, 1300))
         self.assertEqual(geometry["cell_w"], 40.0)
         self.assertEqual(geometry["cell_h"], 100.0)
+
+    def test_aligned_grid_geometry_has_no_second_ocr_offset(self) -> None:
+        geometry = app.calibrate_grid([], (1600, 1300))
+        self.assertEqual(geometry["origin_x"], 0.0)
+        self.assertEqual(geometry["origin_y"], 0.0)
 
 
 class CorrectionSafetyTests(unittest.TestCase):

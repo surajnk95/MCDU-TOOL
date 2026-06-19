@@ -272,7 +272,72 @@ def perspective_coefficients(src: list[dict[str, float]], dst_size: tuple[int, i
     return solve_linear_system(matrix, values)
 
 
-def warp_screen(image: Image.Image, corners: list[dict[str, float]]) -> Image.Image:
+def estimate_grid_origin(image: Image.Image) -> tuple[float, float]:
+    """Find the equal-grid phase whose internal boundaries cross the least ink."""
+    gray = np.asarray(ImageOps.grayscale(image), dtype=np.float32)
+    if gray.size == 0:
+        return 0.0, 0.0
+    threshold = max(118.0, float(np.percentile(gray, 86)))
+    ink = gray >= threshold
+    if float(np.mean(ink)) < 0.002:
+        return 0.0, 0.0
+
+    height, width = ink.shape
+
+    def best_axis_origin(axis: int, length: int, count: int) -> float:
+        pitch = length / count
+        half_strip = max(1.0, pitch * 0.035)
+        candidates = np.linspace(-pitch * 0.45, pitch * 0.45, 145)
+        start_other = int((width if axis == 0 else height) * 0.02)
+        end_other = int((width if axis == 0 else height) * 0.98)
+        scores: list[float] = []
+        for origin in candidates:
+            boundary_scores: list[float] = []
+            for boundary in range(1, count):
+                position = origin + boundary * pitch
+                low = max(0, int(math.floor(position - half_strip)))
+                high = min(length, int(math.ceil(position + half_strip)) + 1)
+                if high <= low:
+                    continue
+                strip = (
+                    ink[start_other:end_other, low:high]
+                    if axis == 0
+                    else ink[low:high, start_other:end_other]
+                )
+                if strip.size:
+                    boundary_scores.append(float(np.mean(strip)))
+            score = float(np.mean(boundary_scores)) if boundary_scores else 1.0
+            score += abs(float(origin)) / pitch * 0.0015
+            scores.append(score)
+        best_index = int(np.argmin(scores))
+        zero_index = int(np.argmin(np.abs(candidates)))
+        # Keep the border-aligned phase when the image does not contain enough
+        # evidence to materially improve it.
+        if scores[best_index] >= scores[zero_index] * 0.94:
+            return 0.0
+        return float(candidates[best_index])
+
+    return best_axis_origin(0, width, COLS), best_axis_origin(1, height, ROWS)
+
+
+def align_warp_to_grid(image: Image.Image) -> tuple[Image.Image, tuple[float, float]]:
+    origin_x, origin_y = estimate_grid_origin(image)
+    if abs(origin_x) < 0.1 and abs(origin_y) < 0.1:
+        return image, (0.0, 0.0)
+    aligned = image.transform(
+        image.size,
+        Image.Transform.AFFINE,
+        (1.0, 0.0, origin_x, 0.0, 1.0, origin_y),
+        Image.Resampling.BICUBIC,
+        fillcolor=(0, 0, 0),
+    )
+    return aligned, (origin_x, origin_y)
+
+
+def warp_screen_with_alignment(
+    image: Image.Image,
+    corners: list[dict[str, float]],
+) -> tuple[Image.Image, tuple[float, float]]:
     screen_size = screen_size_from_corners(corners)
     coeffs = perspective_coefficients(corners, screen_size)
     warped = image.transform(
@@ -281,6 +346,11 @@ def warp_screen(image: Image.Image, corners: list[dict[str, float]]) -> Image.Im
         coeffs,
         Image.Resampling.BICUBIC,
     )
+    return align_warp_to_grid(warped)
+
+
+def warp_screen(image: Image.Image, corners: list[dict[str, float]]) -> Image.Image:
+    warped, _ = warp_screen_with_alignment(image, corners)
     return warped
 
 
@@ -1551,7 +1621,7 @@ def flatten_display(payload: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(corners, list) or len(corners) != 4:
         raise ValueError("Four screen corners are required.")
 
-    warped = warp_screen(image, corners)
+    warped, grid_origin = warp_screen_with_alignment(image, corners)
     preview_id = f"{uuid.uuid4().hex}.png"
     preview_path = EXPORTS / preview_id
     warped.save(preview_path)
@@ -1559,6 +1629,10 @@ def flatten_display(payload: dict[str, Any]) -> dict[str, Any]:
         "previewUrl": f"/data/exports/{preview_id}",
         "width": warped.width,
         "height": warped.height,
+        "gridAlignment": {
+            "x": grid_origin[0] / warped.width,
+            "y": grid_origin[1] / warped.height,
+        },
     }
 
 
@@ -2191,7 +2265,10 @@ def analyze(payload: dict[str, Any]) -> dict[str, Any]:
         )
     _, preprocessing_name, processed, words = max(ocr_candidates, key=lambda item: item[0])
     boxes = run_tesseract_boxes(processed)
-    geometry = calibrate_grid(boxes, screen_size)
+    # warp_screen already phase-aligns the image to the visible 40 x 13 lattice.
+    # Re-fitting an OCR offset here would make extraction disagree with the grid
+    # the user sees and edits in the browser.
+    geometry = calibrate_grid([], screen_size)
 
     word_candidates: list[tuple[str, list[list[str]], list[list[float]]]] = []
     for _, variant_name, _, variant_words in ocr_candidates:

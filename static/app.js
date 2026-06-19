@@ -45,6 +45,7 @@ const state = {
   image: null,
   flatImage: null,
   flatUrl: "",
+  gridAlignment: { x: 0, y: 0 },
   imageDataUrl: "",
   imageBounds: { x: 0, y: 0, width: 0, height: 0, scale: 1 },
   flatBounds: { x: 0, y: 0, width: 0, height: 0, scale: 1 },
@@ -252,6 +253,8 @@ function draw() {
 
 function drawGrid() {
   const corners = getGridCorners().map(imageToCanvas);
+  const originX = state.gridAlignment.x || 0;
+  const originY = state.gridAlignment.y || 0;
 
   ctx.save();
   ctx.lineWidth = 1;
@@ -262,7 +265,7 @@ function drawGrid() {
   ctx.textBaseline = "middle";
 
   for (let col = 0; col <= COLS; col += 1) {
-    const u = col / COLS;
+    const u = originX + col / COLS;
     const top = projectPoint(corners, u, 0);
     const bottom = projectPoint(corners, u, 1);
     ctx.beginPath();
@@ -272,7 +275,7 @@ function drawGrid() {
   }
 
   for (let row = 0; row <= ROWS; row += 1) {
-    const v = row / ROWS;
+    const v = originY + row / ROWS;
     const left = projectPoint(corners, 0, v);
     const right = projectPoint(corners, 1, v);
     ctx.beginPath();
@@ -283,12 +286,12 @@ function drawGrid() {
 
   ctx.fillStyle = "rgba(6, 79, 73, 0.9)";
   for (let row = 0; row < ROWS; row += 1) {
-    const p = projectPoint(corners, -0.035, (row + 0.5) / ROWS);
+    const p = projectPoint(corners, originX - 0.035, originY + (row + 0.5) / ROWS);
     ctx.fillText(String(row + 1), p.x, p.y);
   }
 
   for (let col = 1; col <= 38; col += 1) {
-    const p = projectPoint(corners, (col + 0.5) / COLS, -0.035);
+    const p = projectPoint(corners, originX + (col + 0.5) / COLS, originY - 0.035);
     ctx.fillText(String(col), p.x, p.y);
   }
   ctx.restore();
@@ -573,6 +576,10 @@ async function flattenDisplay(showStatus = true) {
     });
     state.flatImage = image;
     state.flatUrl = result.previewUrl;
+    state.gridAlignment = {
+      x: Number(result.gridAlignment?.x) || 0,
+      y: Number(result.gridAlignment?.y) || 0,
+    };
     photoViewButton.disabled = false;
     flatViewButton.disabled = false;
     setViewMode("flat");
@@ -608,6 +615,7 @@ fileInput.addEventListener("change", () => {
       refineGridButton.disabled = false;
       state.flatImage = null;
       state.flatUrl = "";
+      state.gridAlignment = { x: 0, y: 0 };
       state.confidenceGrid = Array.from({ length: ROWS }, () => Array.from({ length: COLS }, () => 0));
       setViewMode("photo");
       renderGridTable();
@@ -650,7 +658,11 @@ canvas.addEventListener("pointerup", () => {
 });
 
 Object.values(insetInputs).forEach((input) => {
-  input.addEventListener("input", draw);
+  input.addEventListener("input", () => {
+    state.gridAlignment = { x: 0, y: 0 };
+    invalidateFlattenedDisplay();
+    draw();
+  });
 });
 
 resetButton.addEventListener("click", () => {
@@ -660,6 +672,7 @@ resetButton.addEventListener("click", () => {
   defaultCorners();
   state.flatImage = null;
   state.flatUrl = "";
+  state.gridAlignment = { x: 0, y: 0 };
   setViewMode("photo");
   Object.values(insetInputs).forEach((input) => {
     input.value = "0";
