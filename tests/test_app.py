@@ -871,6 +871,27 @@ class PerRowStripOcrTests(unittest.TestCase):
 class FieldValidatorTests(unittest.TestCase):
     """Tests for _snap_fl_token, _snap_decimal_token, and validate_field_formats (#22)."""
 
+    @staticmethod
+    def _label_value(label: str, value: str) -> list[list[str]]:
+        grid = app.empty_grid()
+        for text, r in ((label, 0), (value, 1)):
+            padded = text[: app.COLS].ljust(app.COLS)
+            grid[r] = ["" if ch == " " else ch for ch in padded]
+        return app.normalize_grid_guards(grid)
+
+    def test_mach_speed_leading_dot_restored_in_speed_row(self) -> None:
+        out = app.validate_field_formats(self._label_value(" ECON SPD", "  733"))
+        self.assertEqual("".join(c or " " for c in out[1]).strip(), ".733")
+        out = app.validate_field_formats(self._label_value(" RTA SPD", "  482"))
+        self.assertEqual("".join(c or " " for c in out[1]).strip(), ".482")
+
+    def test_three_digits_not_given_dot_outside_speed_context(self) -> None:
+        # Altitudes / other 3-digit values must never gain a leading dot.
+        out = app.validate_field_formats(self._label_value(" CRZ ALT", "  340"))
+        self.assertEqual("".join(c or " " for c in out[1]).strip(), "340")
+        out = app.validate_field_formats(self._label_value(" OPT", "  344"))
+        self.assertEqual("".join(c or " " for c in out[1]).strip(), "344")
+
     # --- _snap_fl_token ---
 
     def test_snap_fl_correct_token_returns_none(self) -> None:

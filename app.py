@@ -3026,6 +3026,8 @@ def validate_field_formats(grid: list[list[str]]) -> list[list[str]]:
     _spd_re = re.compile(
         r"\b(?:ECON|LRC|SEL|RTA)\s*SPD\b|\bSPD\s*(?:ECON|LRC|SEL|RTA)\b"
     )
+    # Unambiguous cruise-Mach speed labels (SEL SPD can be a knots value).
+    _mach_re = re.compile(r"\b(?:ECON|LRC|RTA)\s*SPD\b|\bSPD\s*(?:ECON|LRC|RTA)\b")
 
     # Pass 1: standalone token-level snapping (no label context needed)
     for row in range(ROWS):
@@ -3047,6 +3049,17 @@ def validate_field_formats(grid: list[list[str]]) -> list[list[str]]:
                 snapped = _snap_decimal_token(token)
                 if snapped:
                     apply_snap(row, start, token, snapped)
+                elif (
+                    re.fullmatch(r"\d{3}", token)
+                    and _mach_re.search(label_text)
+                    and start > FIRST_DATA_COL
+                    and not updated[row][start - 1]
+                ):
+                    # Cruise Mach speed is shown as ".733"; OCR routinely drops the
+                    # faint leading dot. Restore it only for the unambiguous Mach
+                    # labels (ECON/LRC/RTA) — SEL SPD can be a knots value (e.g. 173)
+                    # that must not gain a dot.
+                    updated[row][start - 1] = "."
 
     return updated
 
