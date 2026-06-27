@@ -2770,6 +2770,27 @@ def recover_dash_lines(grid: list[list[str]], warped: Image.Image) -> list[list[
     cell_w = screen_w / COLS
     cell_h = screen_h / ROWS
 
+    # Robust separator pass. The MCDU dashed divider appears as a single thin
+    # bright horizontal line spanning most of the width with little other ink.
+    # OCR otherwise reads it as random characters, so detect it straight from the
+    # image and force the whole data span to dashes, overriding any garbage. The
+    # full-width line (cover ≈ 0.8) is well separated from text rows (cover ≤ 0.5)
+    # and from short entry-box edges, so the threshold is safe.
+    data_x1 = max(0, int(FIRST_DATA_COL * cell_w))
+    data_x2 = min(screen_w, int((LAST_DATA_COL + 1) * cell_w))
+    for row in range(ROWS):
+        y1 = max(0, int(row * cell_h))
+        y2 = min(screen_h, int((row + 1) * cell_h))
+        band = gray[y1:y2, data_x1:data_x2]
+        if band.size == 0 or band.shape[0] == 0:
+            continue
+        bright = band > 160
+        line_cover = float(bright.mean(axis=1).max())
+        total_ink = float(bright.mean())
+        if line_cover >= 0.6 and total_ink <= 0.22:
+            for col in range(FIRST_DATA_COL, LAST_DATA_COL + 1):
+                updated[row][col] = "-"
+
     for row in range(ROWS):
         existing_dash_cols = [
             col for col in range(FIRST_DATA_COL, LAST_DATA_COL + 1) if updated[row][col] == "-"

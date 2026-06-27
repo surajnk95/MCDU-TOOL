@@ -259,6 +259,24 @@ class OcrMergeTests(unittest.TestCase):
         recovered = app.recover_dash_lines(grid, image)
         self.assertTrue(all(recovered[9][col] == "-" for col in range(1, 35)))
 
+    def test_full_width_separator_line_overrides_ocr_garbage(self) -> None:
+        # A thin full-width bright line is the MCDU divider; OCR often misreads it
+        # as random characters. The image-based pass must force the whole data row
+        # to dashes, clearing the garbage.
+        grid = app.empty_grid()
+        for col, ch in zip(range(1, 12), "PSTEGCNGING"):
+            grid[9][col] = ch
+        image = app.Image.new("RGB", (1600, 1300), "black")
+        draw = ImageDraw.Draw(image)
+        cell_h = 1300 / app.ROWS
+        y = int((9 + 0.5) * cell_h)
+        draw.line((1 * 40, y, 39 * 40, y), fill="white", width=4)
+        recovered = app.recover_dash_lines(grid, image)
+        self.assertTrue(
+            all(recovered[9][col] == "-" for col in range(app.FIRST_DATA_COL, app.LAST_DATA_COL + 1)),
+            "full-width separator row should become all dashes",
+        )
+
     def test_dash_recovery_does_not_fill_between_text_blocks(self) -> None:
         grid = app.empty_grid()
         grid[0][2] = "A"
