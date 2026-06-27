@@ -420,6 +420,260 @@ def preprocessing_variants(image: Image.Image) -> list[tuple[str, Image.Image]]:
     return variants
 
 
+# ---------------------------------------------------------------------------
+# #14 — Magenta cursor erasure
+# #15 — Glare suppression
+# #16 — Coloured message-box OCR (non-inverted preprocessing)
+# #17 — Entry-field outline erasure
+# All operate on the perspective-corrected (warped) MCDU image.
+# ---------------------------------------------------------------------------
+
+
+def erase_magenta_cursor(rgb: np.ndarray) -> np.ndarray:
+    """Detect and inpaint the magenta + crosshair cursor (#14).
+
+    The cursor is distinguished from magenta text by its cross shape: a
+    significant fraction of its pixels lie on both the horizontal AND vertical
+    centre strips of the component bounding box.
+    """
+    try:
+        import cv2
+    except ImportError:
+        return rgb
+
+    hsv = cv2.cvtColor(rgb, cv2.COLOR_RGB2HSV)
+    # Magenta: OpenCV hue 130-179 (≈ 260-358° standard), high S and V
+    mag_mask = cv2.inRange(
+        hsv,
+        np.array([130, 80, 100], dtype=np.uint8),
+        np.array([179, 255, 255], dtype=np.uint8),
+    )
+    if not np.any(mag_mask):
+        return rgb
+
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(mag_mask, connectivity=8)
+    inpaint_mask = np.zeros_like(mag_mask)
+
+    for i in range(1, num_labels):
+        area = int(stats[i, cv2.CC_STAT_AREA])
+        if area < 20 or area > 8000:
+            continue
+        bx = int(stats[i, cv2.CC_STAT_LEFT])
+        by = int(stats[i, cv2.CC_STAT_TOP])
+        bw = int(stats[i, cv2.CC_STAT_WIDTH])
+        bh = int(stats[i, cv2.CC_STAT_HEIGHT])
+        if bw < 6 or bh < 6:
+            continue
+        aspect = bw / bh
+        if aspect < 0.25 or aspect > 4.0:  # not cross-like aspect ratio
+            continue
+
+        # Cross-shape test: both the horizontal AND vertical centre strips must
+        # account for at least 20 % of the component pixels each.
+        ys, xs = np.nonzero(labels == i)
+        cx = bx + bw // 2
+        cy = by + bh // 2
+        arm_half = max(4, min(bw, bh) // 6)
+        in_h = (ys >= cy - arm_half) & (ys <= cy + arm_half)
+        in_v = (xs >= cx - arm_half) & (xs <= cx + arm_half)
+        h_frac = float(np.sum(in_h)) / area
+        v_frac = float(np.sum(in_v)) / area
+        # Corner-emptiness test: a real crosshair keeps almost all of its pixels on
+        # the two arms, leaving the four corners empty. A centred glyph (digit or
+        # letter) fills the corners, so reject it. Without this, magenta values
+        # (FL204, .860, 12000, ...) would be silently inpainted away.
+        in_arms = float(np.sum(in_h | in_v)) / area
+        if h_frac >= 0.20 and v_frac >= 0.20 and in_arms >= 0.85:
+            inpaint_mask[labels == i] = 255
+
+    if not np.any(inpaint_mask):
+        return rgb
+
+    inpaint_mask = cv2.dilate(inpaint_mask, np.ones((3, 3), np.uint8), iterations=1)
+    return cv2.inpaint(rgb, inpaint_mask, inpaintRadius=4, flags=cv2.INPAINT_TELEA)
+
+
+def suppress_glare(rgb: np.ndarray, cell_w: float, cell_h: float) -> np.ndarray:
+    """Inpaint large bright-white glare blooms (#15).
+
+    Glare: very bright (V > 240) and nearly unsaturated (S < 30) blobs larger
+    than four character cells.  Small bright areas (OCR text) are left alone.
+    """
+    try:
+        import cv2
+    except ImportError:
+        return rgb
+
+    hsv = cv2.cvtColor(rgb, cv2.COLOR_RGB2HSV)
+    glare_mask = cv2.inRange(
+        hsv,
+        np.array([0, 0, 240], dtype=np.uint8),
+        np.array([179, 30, 255], dtype=np.uint8),
+    )
+    if not np.any(glare_mask):
+        return rgb
+
+    min_area = max(500, int(cell_w * cell_h * 4))
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(glare_mask, connectivity=8)
+    inpaint_mask = np.zeros_like(glare_mask)
+    for i in range(1, num_labels):
+        if int(stats[i, cv2.CC_STAT_AREA]) >= min_area:
+            inpaint_mask[labels == i] = 255
+
+    if not np.any(inpaint_mask):
+        return rgb
+
+    return cv2.inpaint(rgb, inpaint_mask, inpaintRadius=5, flags=cv2.INPAINT_TELEA)
+
+
+def erase_entry_outlines(rgb: np.ndarray, cell_w: float, cell_h: float) -> np.ndarray:
+    """Erase thin rectangular entry-field box outlines (#17).
+
+    Detected as 4-vertex closed contours that are small (1–8 cols × 1–2 rows),
+    have a low fill ratio (thin border, mostly empty inside), and do not touch
+    the image edges.  Matched pixels are set to black (MCDU background).
+    """
+    try:
+        import cv2
+    except ImportError:
+        return rgb
+
+    gray = np.max(rgb, axis=2).astype(np.uint8)
+    blurred = cv2.GaussianBlur(gray, (3, 3), 0)
+    edges = cv2.Canny(blurred, 40, 120)
+
+    contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        return rgb
+
+    h_img, w_img = gray.shape
+    erase_mask = np.zeros_like(gray)
+
+    for contour in contours:
+        area = cv2.contourArea(contour)
+        if area < cell_w * cell_h * 0.05:  # skip tiny noise
+            continue
+        perimeter = cv2.arcLength(contour, True)
+        if perimeter < 1:
+            continue
+        approx = cv2.approxPolyDP(contour, 0.06 * perimeter, True)
+        if len(approx) != 4:
+            continue
+        bx, by, bw, bh = cv2.boundingRect(contour)
+        # Skip contours touching the image border (avoids erasing the display frame)
+        if bx <= 2 or by <= 2 or bx + bw >= w_img - 2 or by + bh >= h_img - 2:
+            continue
+        if bw < cell_w * 0.4 or bh < cell_h * 0.3:
+            continue
+        if bw > cell_w * 9 or bh > cell_h * 2.5:
+            continue
+        # Thin-outline test: count actual bright pixels in the bounding box.
+        # cv2.contourArea includes the interior hole for a ring contour, so it
+        # over-counts; counting max-channel pixels above 30 gives the real fill.
+        bright = int(np.sum(gray[by : by + bh, bx : bx + bw] > 30))
+        if bright / max(1.0, float(bw * bh)) > 0.35:
+            continue
+        cv2.drawContours(erase_mask, [contour], -1, 255, thickness=2)
+
+    if not np.any(erase_mask):
+        return rgb
+
+    result = rgb.copy()
+    result[erase_mask > 0] = 0
+    return result
+
+
+def clean_warped_image(warped: Image.Image) -> Image.Image:
+    """Apply cursor removal (#14), glare suppression (#15), and entry-outline
+    erasure (#17) to the perspective-corrected MCDU display image before OCR.
+
+    Operations are applied in order: outlines → cursor → glare.
+    Returns the original image unchanged if OpenCV is not available.
+    """
+    try:
+        import cv2  # noqa: F401
+    except ImportError:
+        return warped
+
+    rgb = np.asarray(warped.convert("RGB"), dtype=np.uint8)
+    h, w = rgb.shape[:2]
+    cell_w = w / COLS
+    cell_h = h / ROWS
+
+    rgb = erase_entry_outlines(rgb, cell_w, cell_h)  # #17 — remove box outlines first
+    rgb = erase_magenta_cursor(rgb)                   # #14 — inpaint cursor
+    rgb = suppress_glare(rgb, cell_w, cell_h)         # #15 — inpaint bright blooms
+
+    return Image.fromarray(rgb, mode="RGB")
+
+
+def _preprocess_message_box_region(crop_rgb: np.ndarray) -> Image.Image:
+    """Preprocess a coloured-background message-box crop for Tesseract (#16).
+
+    Uses (255 − S) × V / 255 so white text (S≈0, V≈255) → bright (then
+    inverted to black) and the coloured background (S≈200, V≈150) → dim
+    (inverted to light grey).  Result: dark text on light background.
+    """
+    import cv2
+    hsv = cv2.cvtColor(crop_rgb, cv2.COLOR_RGB2HSV).astype(np.float32)
+    s, v = hsv[:, :, 1], hsv[:, :, 2]
+    text_gray = np.clip((255.0 - s) * v / 255.0, 0, 255).astype(np.uint8)
+    return Image.fromarray(255 - text_gray, mode="L")
+
+
+def ocr_message_boxes(warped: Image.Image, geometry: dict) -> list[dict]:
+    """Detect coloured message boxes and OCR them without global inversion (#16).
+
+    Bright, saturated filled rectangles (blue/cyan/amber background with white
+    text) are cropped, preprocessed with white-text extraction, and passed to
+    Tesseract individually.  Returned words carry coordinates in the warped-image
+    space so they can be fed directly to place_word().
+    """
+    try:
+        import cv2
+    except ImportError:
+        return []
+
+    rgb = np.asarray(warped.convert("RGB"), dtype=np.uint8)
+    h, w = rgb.shape[:2]
+    cell_w = w / COLS
+    cell_h = h / ROWS
+
+    hsv = cv2.cvtColor(rgb, cv2.COLOR_RGB2HSV)
+    # Saturated (S > 60) and bright (V > 80) — covers blue, cyan, and amber boxes
+    color_mask = cv2.inRange(
+        hsv,
+        np.array([0, 60, 80], dtype=np.uint8),
+        np.array([179, 255, 255], dtype=np.uint8),
+    )
+    # Skip areas smaller than 3 character cells (avoids per-character colour noise)
+    min_area = max(500, int(cell_w * cell_h * 3))
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(color_mask, connectivity=8)
+
+    words: list[dict] = []
+    for i in range(1, num_labels):
+        area = int(stats[i, cv2.CC_STAT_AREA])
+        if area < min_area:
+            continue
+        bx = int(stats[i, cv2.CC_STAT_LEFT])
+        by = int(stats[i, cv2.CC_STAT_TOP])
+        bw = int(stats[i, cv2.CC_STAT_WIDTH])
+        bh = int(stats[i, cv2.CC_STAT_HEIGHT])
+        # Solid-fill check: scattered coloured text pixels have low fill
+        if area / max(1, bw * bh) < 0.50:
+            continue
+        crop = rgb[by : by + bh, bx : bx + bw]
+        if crop.size == 0:
+            continue
+        preprocessed = _preprocess_message_box_region(crop)
+        padded = ImageOps.expand(preprocessed, border=4, fill=255)
+        for word in run_tesseract_tsv(padded):
+            word["left"] = int(word.get("left", 0)) - 4 + bx
+            word["top"] = int(word.get("top", 0)) - 4 + by
+            words.append(word)
+    return words
+
+
 def cell_feature(image: Image.Image, row: int, col: int) -> list[float]:
     screen_w, screen_h = image.size
     cell_w = screen_w / COLS
@@ -2423,6 +2677,7 @@ def analyze(payload: dict[str, Any]) -> dict[str, Any]:
         raise ValueError("Four screen corners are required.")
 
     warped = warp_screen(image, corners)
+    warped = clean_warped_image(warped)  # #14/#15/#17: cursor / glare / outlines
     screen_size = warped.size
     ocr_candidates: list[tuple[float, str, Image.Image, list[dict[str, Any]]]] = []
     for variant_name, variant_image in preprocessing_variants(warped):
@@ -2445,6 +2700,16 @@ def analyze(payload: dict[str, Any]) -> dict[str, Any]:
         for word in variant_words:
             place_word(candidate_grid, candidate_scores, candidate_confidence, word, geometry)
         word_candidates.append((variant_name, candidate_grid, candidate_confidence))
+
+    # #16: OCR coloured message boxes (blue/cyan/amber) without global inversion
+    box_words = ocr_message_boxes(warped, geometry)
+    if box_words:
+        box_grid = empty_grid()
+        box_scores: list[list[float]] = [[0.0] * COLS for _ in range(ROWS)]
+        box_confidence = empty_confidence_grid()
+        for word in box_words:
+            place_word(box_grid, box_scores, box_confidence, word, geometry)
+        word_candidates.append(("message_box", box_grid, box_confidence))
 
     hybrid_requested = bool(payload.get("hybridOcr", True))
     paddle_words: list[dict[str, Any]] = []
@@ -2528,6 +2793,7 @@ def refine_grid(payload: dict[str, Any]) -> dict[str, Any]:
         raise ValueError("Four screen corners are required.")
     grid = grid_from_payload(payload.get("grid"))
     warped = warp_screen(image, corners)
+    warped = clean_warped_image(warped)  # #14/#15/#17: cursor / glare / outlines
     refined, summary = whole_grid_focused_recheck(warped, grid, str(payload.get("mode", "conservative")))
     return {"grid": refined, "verification": summary}
 

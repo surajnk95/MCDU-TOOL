@@ -577,5 +577,194 @@ class MultiScreenDetectionTests(unittest.TestCase):
         self.assertEqual(result["candidates"][0]["touchesEdge"], False)
 
 
+# ---------------------------------------------------------------------------
+# Helper builders for #14–#17 tests
+# ---------------------------------------------------------------------------
+
+def make_magenta_cross_image(
+    width: int = 120, height: int = 100, arm: int = 4
+) -> np.ndarray:
+    """Dark RGB image with a centred magenta + cross (R=220, G=0, B=220)."""
+    arr = np.zeros((height, width, 3), dtype=np.uint8)
+    cx, cy = width // 2, height // 2
+    arr[cy - arm : cy + arm + 1, :, 0] = 220  # H-arm: R channel
+    arr[cy - arm : cy + arm + 1, :, 2] = 220  # H-arm: B channel
+    arr[:, cx - arm : cx + arm + 1, 0] = 220  # V-arm: R channel
+    arr[:, cx - arm : cx + arm + 1, 2] = 220  # V-arm: B channel
+    return arr
+
+
+def make_magenta_L_image(width: int = 60, height: int = 100, thick: int = 5) -> np.ndarray:
+    """Dark RGB image with an L-shaped magenta blob (not a cross)."""
+    arr = np.zeros((height, width, 3), dtype=np.uint8)
+    arr[:, :thick, 0] = 220             # vertical bar on the left
+    arr[:, :thick, 2] = 220
+    arr[-thick:, :, 0] = 220            # horizontal bar at the bottom
+    arr[-thick:, :, 2] = 220
+    return arr
+
+
+def make_magenta_block_image(width: int = 60, height: int = 60) -> np.ndarray:
+    """Dark RGB image with a centred filled magenta block (a stand-in for a
+    centred magenta glyph such as a digit). Fills its corners, so it must NOT be
+    mistaken for a crosshair and erased."""
+    arr = np.zeros((height, width, 3), dtype=np.uint8)
+    cx, cy = width // 2, height // 2
+    half = min(width, height) // 4
+    arr[cy - half : cy + half, cx - half : cx + half, 0] = 220
+    arr[cy - half : cy + half, cx - half : cx + half, 2] = 220
+    return arr
+
+
+def make_glare_image(
+    width: int = 200, height: int = 150, blob_size: int = 60
+) -> np.ndarray:
+    """Dark RGB image with one large bright-white glare blob."""
+    arr = np.full((height, width, 3), 20, dtype=np.uint8)
+    cx, cy = width // 2, height // 2
+    r = blob_size // 2
+    arr[cy - r : cy + r, cx - r : cx + r] = 255
+    return arr
+
+
+def make_thin_rect_image(width: int = 400, height: int = 260) -> np.ndarray:
+    """Dark RGB image with a thin bright rectangle outline (~4 cols × 1 row).
+
+    Image is sized 400×260 so cell_w=10, cell_h=20.  The rectangle at
+    (20,10)-(60,30) is 40×20 px = 4 cols × 1 row — within the 9-col limit.
+    """
+    arr = np.zeros((height, width, 3), dtype=np.uint8)
+    x0, y0, x1, y1 = 20, 10, 60, 30  # not touching the image edge
+    arr[y0 : y0 + 2, x0 : x1] = 220  # top border
+    arr[y1 - 2 : y1, x0 : x1] = 220  # bottom border
+    arr[y0 : y1, x0 : x0 + 2] = 220  # left border
+    arr[y0 : y1, x1 - 2 : x1] = 220  # right border
+    return arr
+
+
+class CleanWarpedTests(unittest.TestCase):
+    """Tests for #14 (cursor erasure), #15 (glare), #16 (message boxes), #17 (outlines)."""
+
+    def _skip_no_cv2(self) -> None:
+        try:
+            import cv2  # noqa: F401
+        except ImportError:
+            self.skipTest("OpenCV not installed")
+
+    # --- #14 cursor erasure ------------------------------------------------
+
+    def test_erase_magenta_cursor_removes_cross(self) -> None:
+        self._skip_no_cv2()
+        rgb = make_magenta_cross_image()
+        cx, cy = rgb.shape[1] // 2, rgb.shape[0] // 2
+        # Centre pixel should be magenta before erasure
+        self.assertEqual(rgb[cy, cx, 0], 220)
+        self.assertEqual(rgb[cy, cx, 1], 0)
+        result = app.erase_magenta_cursor(rgb)
+        # After inpaint, the cross centre should no longer be pure magenta
+        centre = result[cy, cx]
+        is_magenta = centre[0] > 180 and centre[1] < 40 and centre[2] > 180
+        self.assertFalse(is_magenta, "Centre pixel should be inpainted, not still magenta")
+
+    def test_erase_magenta_cursor_preserves_L_shape(self) -> None:
+        self._skip_no_cv2()
+        # An L-shaped magenta blob is NOT a cross — it should NOT be inpainted
+        rgb = make_magenta_L_image()
+        before_sum = int(np.sum(rgb[:, :, 0] > 100))  # count R-high pixels
+        result = app.erase_magenta_cursor(rgb)
+        after_sum = int(np.sum(result[:, :, 0] > 100))
+        # Most magenta pixels should survive (the L is not a cross)
+        self.assertGreater(after_sum, before_sum * 0.7, "L-shaped magenta was wrongly erased")
+
+    def test_erase_magenta_cursor_noop_on_dark_image(self) -> None:
+        self._skip_no_cv2()
+        rgb = np.zeros((80, 100, 3), dtype=np.uint8)
+        result = app.erase_magenta_cursor(rgb)
+        np.testing.assert_array_equal(result, rgb)
+
+    def test_erase_magenta_cursor_preserves_centred_glyph(self) -> None:
+        self._skip_no_cv2()
+        # A centred filled magenta block (like a magenta digit/value) fills its
+        # corners and must survive — it is not a crosshair.
+        rgb = make_magenta_block_image()
+        before = int(np.sum(rgb[:, :, 0] > 100))
+        result = app.erase_magenta_cursor(rgb)
+        after = int(np.sum(result[:, :, 0] > 100))
+        self.assertGreater(
+            after, before * 0.9, "Centred magenta glyph was wrongly erased as a cursor"
+        )
+
+    # --- #15 glare suppression ---------------------------------------------
+
+    def test_suppress_glare_removes_large_bright_blob(self) -> None:
+        self._skip_no_cv2()
+        rgb = make_glare_image(blob_size=80)
+        h, w = rgb.shape[:2]
+        cell_w = w / app.COLS
+        cell_h = h / app.ROWS
+        # Blob is large enough to exceed the min-area threshold
+        result = app.suppress_glare(rgb, cell_w, cell_h)
+        cx, cy = w // 2, h // 2
+        # The centre of the blob should no longer be pure white after inpainting
+        centre = result[cy, cx]
+        self.assertLess(int(centre.min()), 240, "Glare centre should be reduced by inpainting")
+
+    def test_suppress_glare_preserves_small_bright_pixels(self) -> None:
+        self._skip_no_cv2()
+        # A single bright pixel (text-sized) must survive — it is below the area threshold
+        rgb = np.zeros((80, 100, 3), dtype=np.uint8)
+        rgb[40, 50] = 255
+        cell_w = 100 / app.COLS
+        cell_h = 80 / app.ROWS
+        result = app.suppress_glare(rgb, cell_w, cell_h)
+        np.testing.assert_array_equal(result[40, 50], [255, 255, 255])
+
+    # --- #17 entry-outline erasure -----------------------------------------
+
+    def test_erase_entry_outlines_removes_thin_rectangle(self) -> None:
+        self._skip_no_cv2()
+        rgb = make_thin_rect_image()           # 400×260
+        h, w = rgb.shape[:2]
+        cell_w = w / app.COLS                  # 400/40 = 10
+        cell_h = h / app.ROWS                  # 260/13 = 20
+        # Top border at y=10 should be bright before erasure
+        self.assertGreater(int(rgb[10, 40, 0]), 100)
+        result = app.erase_entry_outlines(rgb, cell_w, cell_h)
+        # After erasure, the top border pixel should be dark
+        self.assertLess(int(result[10, 40, 0]), 50, "Top border pixel should be erased")
+
+    # --- composite + #16 ---------------------------------------------------
+
+    def test_clean_warped_image_returns_same_size(self) -> None:
+        self._skip_no_cv2()
+        warped = Image.new("RGB", (1600, 1040), (0, 0, 0))
+        result = app.clean_warped_image(warped)
+        self.assertIsInstance(result, Image.Image)
+        self.assertEqual(result.size, (1600, 1040))
+
+    def test_clean_warped_image_noop_on_dark_screen(self) -> None:
+        self._skip_no_cv2()
+        warped = Image.new("RGB", (400, 260), (5, 5, 5))
+        result = app.clean_warped_image(warped)
+        # No cursor, no glare, no outlines → image should be virtually identical
+        arr_in = np.asarray(warped)
+        arr_out = np.asarray(result)
+        self.assertEqual(arr_in.shape, arr_out.shape)
+
+    def test_message_box_preprocessing_makes_white_text_dark(self) -> None:
+        self._skip_no_cv2()
+        # Blue background (R=0, G=0, B=200) with a white text patch (R=G=B=255)
+        crop = np.zeros((40, 80, 3), dtype=np.uint8)
+        crop[:] = [0, 0, 200]                     # blue background
+        crop[10:30, 20:60] = [255, 255, 255]      # white text area
+        result_arr = np.asarray(app._preprocess_message_box_region(crop))
+        # White text → (255−0)×255/255 = 255, inverted → 0 (dark)
+        white_region = result_arr[10:30, 20:60]
+        # Blue bg → (255−200ish)×200ish/255 ≈ 43, inverted → ~212 (light)
+        bg_region = result_arr[:, :10]
+        self.assertLess(float(white_region.mean()), 60, "White text should become dark")
+        self.assertGreater(float(bg_region.mean()), 100, "Blue bg should become light")
+
+
 if __name__ == "__main__":
     unittest.main()
