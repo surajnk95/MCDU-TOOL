@@ -43,6 +43,10 @@ const insetInputs = {
   bottom: document.querySelector("#bottomInset"),
 };
 
+const blurBanner = document.querySelector("#blurBanner");
+const blurBannerDismiss = document.querySelector("#blurBannerDismiss");
+const stageHint = document.querySelector("#stageHint");
+
 const state = {
   image: null,
   flatImage: null,
@@ -58,8 +62,17 @@ const state = {
   viewMode: "photo",
   sourceGrid: makeEmptyGrid(),
   confidenceGrid: Array.from({ length: ROWS }, () => Array.from({ length: COLS }, () => 0)),
+  colorGrid: Array.from({ length: ROWS }, () => Array.from({ length: COLS }, () => "")),
   requirements: [],
 };
+
+function makeEmptyColorGrid() {
+  return Array.from({ length: ROWS }, () => Array.from({ length: COLS }, () => ""));
+}
+
+function setStageHint(hint) {
+  if (stageHint) stageHint.textContent = hint;
+}
 
 function setStatus(message) {
   statusEl.textContent = message;
@@ -471,14 +484,23 @@ function findHandle(point) {
   return nearest;
 }
 
-function renderGridTable(grid = makeEmptyGrid(), confidenceGrid = state.confidenceGrid) {
+function renderGridTable(
+  grid = makeEmptyGrid(),
+  confidenceGrid = state.confidenceGrid,
+  colorGrid = state.colorGrid,
+) {
   gridTable.textContent = "";
   const thead = document.createElement("thead");
   const header = document.createElement("tr");
   header.appendChild(document.createElement("th")).textContent = "Row";
   for (let col = 0; col < COLS; col += 1) {
     const th = document.createElement("th");
-    th.textContent = col >= 1 && col <= 38 ? String(col) : "";
+    if (col >= 1 && col <= 38) {
+      th.textContent = String(col);
+    } else {
+      th.classList.add("guard-col-header");
+      th.title = "Guard column (always blank)";
+    }
     header.appendChild(th);
   }
   thead.appendChild(header);
@@ -496,15 +518,25 @@ function renderGridTable(grid = makeEmptyGrid(), confidenceGrid = state.confiden
       td.dataset.row = String(row);
       td.dataset.col = String(col);
       td.textContent = col >= FIRST_DATA_COL && col <= LAST_DATA_COL ? grid[row]?.[col]?.trim() || "" : "";
+
       const confidence = Number(confidenceGrid?.[row]?.[col] || 0);
       if (td.textContent && confidence > 0 && confidence < 0.62) {
         td.classList.add("low-confidence");
         td.title = `Low OCR confidence: ${Math.round(confidence * 100)}%`;
       }
+
+      const mcduColor = col >= FIRST_DATA_COL && col <= LAST_DATA_COL
+        ? (colorGrid?.[row]?.[col] || "")
+        : "";
+      if (mcduColor && mcduColor !== "white") {
+        td.classList.add(`mcdu-${mcduColor}`);
+      }
+
       if (col < FIRST_DATA_COL || col > LAST_DATA_COL) {
         td.contentEditable = "false";
         td.classList.add("guard-cell");
       }
+
       td.addEventListener("input", () => {
         const value = td.textContent.replace(/\s+/g, "").slice(-1).toUpperCase();
         if (td.textContent !== value) {
@@ -515,6 +547,7 @@ function renderGridTable(grid = makeEmptyGrid(), confidenceGrid = state.confiden
         exportButton.disabled = false;
         rememberButton.disabled = false;
       });
+
       td.addEventListener("paste", (event) => {
         event.preventDefault();
         const text = event.clipboardData?.getData("text")?.replace(/\s+/g, "").toUpperCase() || "";
@@ -535,6 +568,17 @@ function renderGridTable(grid = makeEmptyGrid(), confidenceGrid = state.confiden
         exportButton.disabled = false;
         rememberButton.disabled = false;
       });
+
+      td.addEventListener("keydown", (e) => {
+        const moves = { ArrowLeft: [0, -1], ArrowRight: [0, 1], ArrowUp: [-1, 0], ArrowDown: [1, 0] };
+        if (!(e.key in moves)) return;
+        e.preventDefault();
+        const [dr, dc] = moves[e.key];
+        const nr = Math.max(0, Math.min(ROWS - 1, row + dr));
+        const nc = Math.max(FIRST_DATA_COL, Math.min(LAST_DATA_COL, col + dc));
+        gridTable.querySelector(`td[data-row="${nr}"][data-col="${nc}"][contenteditable="true"]`)?.focus();
+      });
+
       tr.appendChild(td);
     }
     tbody.appendChild(tr);
@@ -656,6 +700,7 @@ async function autoDetectDisplay(skipOrientationProbe = false) {
         : "";
       const rotateNote = rotation !== 0 ? ` (auto-rotated ${rotation}°)` : "";
       setStatus(`${method}${size}${multiNote}${rotateNote}`);
+      setStageHint("Screen detected — adjust corners if needed, then click Analyze Grid.");
       await flattenDisplay(false);
       return true;
     }
@@ -738,9 +783,12 @@ fileInput.addEventListener("change", () => {
       state.candidates = [];
       state.selectedCandidateIndex = -1;
       state.confidenceGrid = Array.from({ length: ROWS }, () => Array.from({ length: COLS }, () => 0));
+      state.colorGrid = makeEmptyColorGrid();
+      blurBanner.hidden = true;
       setViewMode("photo");
       renderGridTable();
       setStatus("Image loaded");
+      setStageHint("Auto Detect will find the screen — or drag the four corners manually, then Analyze Grid.");
       fitCanvas();
       autoDetectDisplay();
     });
@@ -871,7 +919,9 @@ analyzeButton.addEventListener("click", async () => {
     return;
   }
   analyzeButton.disabled = true;
+  analyzeButton.dataset.loading = "true";
   setStatus("Analyzing OCR");
+  setStageHint("Running OCR — this may take a few seconds…");
   try {
     const result = await postJson("/api/analyze", {
       image: state.imageDataUrl,
@@ -884,7 +934,9 @@ analyzeButton.addEventListener("click", async () => {
     });
     state.sourceGrid = normalizeGridGuards(result.grid);
     state.confidenceGrid = result.confidenceGrid || Array.from({ length: ROWS }, () => Array.from({ length: COLS }, () => 0));
-    renderGridTable(state.sourceGrid, state.confidenceGrid);
+    state.colorGrid = result.colorGrid || makeEmptyColorGrid();
+    blurBanner.hidden = !result.blurry;
+    renderGridTable(state.sourceGrid, state.confidenceGrid, state.colorGrid);
     renderVerificationSummary(result.verification);
     exportButton.disabled = false;
     rememberButton.disabled = false;
@@ -896,11 +948,15 @@ analyzeButton.addEventListener("click", async () => {
     const paddleNote = result.ocrEngines?.paddleError && hybridOcr.checked
       ? `; Paddle unavailable (${result.ocrEngines.paddleError})`
       : "";
-    setStatus(`OCR complete using ${engines}: ${boxCount} character boxes, ${result.words.length} text blocks${preprocessing}${refined}${paddleNote}`);
+    const blurNote = result.blurry ? ` (blurry, score ${result.blurScore})` : "";
+    setStatus(`OCR complete using ${engines}: ${boxCount} character boxes, ${result.words.length} text blocks${preprocessing}${refined}${paddleNote}${blurNote}`);
+    setStageHint("Grid extracted — edit any cells, then Export Word File or Remember Corrections.");
   } catch (error) {
     setStatus(error.message);
+    setStageHint("OCR failed — check the status bar for details.");
   } finally {
     analyzeButton.disabled = false;
+    delete analyzeButton.dataset.loading;
   }
 });
 
@@ -920,7 +976,8 @@ refineGridButton.addEventListener("click", async () => {
     });
     state.sourceGrid = normalizeGridGuards(result.grid);
     state.confidenceGrid = Array.from({ length: ROWS }, () => Array.from({ length: COLS }, () => 0));
-    renderGridTable(state.sourceGrid, state.confidenceGrid);
+    state.colorGrid = result.colorGrid || makeEmptyColorGrid();
+    renderGridTable(state.sourceGrid, state.confidenceGrid, state.colorGrid);
     renderVerificationSummary(result.verification);
     exportButton.disabled = false;
     rememberButton.disabled = false;
@@ -936,6 +993,7 @@ refineGridButton.addEventListener("click", async () => {
 exportButton.addEventListener("click", async () => {
   setStatus("Creating Word file");
   exportButton.disabled = true;
+  exportButton.dataset.loading = "true";
   try {
     const result = await postJson("/api/export-docx", {
       grid: getCurrentGrid(),
@@ -945,10 +1003,12 @@ exportButton.addEventListener("click", async () => {
     link.download = result.filename;
     link.click();
     setStatus("Word file exported");
+    setStageHint("Word file saved — all done.");
   } catch (error) {
     setStatus(error.message);
   } finally {
     exportButton.disabled = false;
+    delete exportButton.dataset.loading;
   }
 });
 
@@ -1145,6 +1205,14 @@ reviewRequirementsButton.addEventListener("click", async () => {
     reviewRequirementsButton.disabled = false;
   }
 });
+
+blurBannerDismiss.addEventListener("click", () => {
+  blurBanner.hidden = true;
+});
+
+resetButton.addEventListener("click", () => {
+  setStageHint("Corners reset — drag them to the screen edges, then click Analyze Grid.");
+}, { capture: true });
 
 window.addEventListener("resize", fitCanvas);
 renderGridTable();

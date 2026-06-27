@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>777-9 MCDU Grid Tool</title>
-    <link rel="stylesheet" href="/styles.css?v=hybrid-ocr" />
+    <link rel="stylesheet" href="/styles.css?v=p6-ui" />
   </head>
   <body>
     <header class="topbar">
@@ -23,6 +23,11 @@
             <input id="fileInput" type="file" accept="image/*" />
             Choose Image
           </label>
+        </div>
+
+        <div id="blurBanner" class="blur-banner" hidden>
+          <span>&#9888; This photo looks blurry &mdash; results may be unreliable. Consider retaking.</span>
+          <button type="button" id="blurBannerDismiss" class="blur-banner-dismiss" aria-label="Dismiss">&times;</button>
         </div>
 
         <div class="canvas-shell">
@@ -50,21 +55,33 @@
         </div>
 
         <div class="actions">
-          <button id="resetCorners" type="button">Reset Corners</button>
-          <button id="detectButton" type="button" disabled>Auto Detect Display</button>
-          <button id="rotateCcwButton" type="button" disabled title="Rotate 90° counter-clockwise">&#x21BA; Rotate CCW</button>
-          <button id="rotateCwButton" type="button" disabled title="Rotate 90° clockwise">&#x21BB; Rotate CW</button>
-          <button id="photoViewButton" type="button" disabled>Photo View</button>
-          <button id="flatViewButton" type="button" disabled>Flattened View</button>
-          <button id="analyzeButton" class="primary" type="button" disabled>Analyze Grid</button>
-          <button id="exportButton" type="button" disabled>Export Word File</button>
+          <div class="stage-group">
+            <span class="stage-label">1 Align</span>
+            <button id="detectButton" type="button" disabled>Auto Detect Display</button>
+            <button id="rotateCcwButton" type="button" disabled title="Rotate 90° counter-clockwise">&#x21BA; Rotate CCW</button>
+            <button id="rotateCwButton" type="button" disabled title="Rotate 90° clockwise">&#x21BB; Rotate CW</button>
+            <button id="resetCorners" type="button">Reset Corners</button>
+          </div>
+          <div class="stage-group">
+            <span class="stage-label">2 View</span>
+            <button id="photoViewButton" type="button" disabled>Photo View</button>
+            <button id="flatViewButton" type="button" disabled>Flattened View</button>
+          </div>
+          <div class="stage-group">
+            <span class="stage-label">3 Read</span>
+            <label class="stage-toggle">
+              <input id="hybridOcr" type="checkbox" checked />
+              Hybrid OCR
+            </label>
+            <button id="analyzeButton" class="primary" type="button" disabled>Analyze Grid</button>
+          </div>
+          <div class="stage-group">
+            <span class="stage-label">4 Export</span>
+            <button id="exportButton" type="button" disabled>Export Word File</button>
+          </div>
         </div>
-        <div class="ocr-options">
-          <label class="toggle-label">
-            <input id="hybridOcr" type="checkbox" checked />
-            Hybrid OCR (Tesseract + PaddleOCR when installed)
-          </label>
-        </div>
+
+        <div id="stageHint" class="stage-hint">Load a photo to begin.</div>
       </section>
 
       <section class="panel results-panel">
@@ -88,53 +105,56 @@
           <button id="refineGridButton" type="button" disabled>Focused Recheck</button>
           <div id="verificationSummary" class="verification-summary" hidden></div>
         </div>
-        <div class="requirement-builder">
-          <label>
-            Row
-            <input id="requirementRow" type="number" min="1" max="13" value="1" />
-          </label>
-          <label>
-            Start column
-            <input id="requirementStart" type="number" min="1" max="38" value="1" />
-          </label>
-          <label>
-            End column
-            <input id="requirementEnd" type="number" min="1" max="38" value="1" />
-          </label>
-          <label>
-            Check
-            <select id="requirementType">
-              <option value="exact">Exact text</option>
-              <option value="contains">Contains text</option>
-              <option value="fill">Fill range with character</option>
-              <option value="blank">Range must be blank</option>
-              <option value="not_contains">Must not contain text</option>
-            </select>
-          </label>
-          <label class="requirement-text-field">
-            Expected text
-            <input id="requirementText" type="text" autocomplete="off" />
-          </label>
-          <label class="toggle-label">
-            <input id="requirementIgnoreCase" type="checkbox" checked />
-            Ignore case
-          </label>
-          <label class="toggle-label">
-            <input id="requirementIgnoreSpaces" type="checkbox" />
-            Ignore extra spaces
-          </label>
-          <button id="addRequirementButton" type="button">Add Requirement</button>
-          <button id="reviewRequirementsButton" class="primary" type="button" disabled>Review All</button>
-        </div>
-        <div id="requirementList" class="requirement-list"></div>
-        <div id="requirementsSummary" class="requirements-summary" hidden></div>
-        <div id="requirementsResults" class="requirements-results" hidden></div>
+        <details class="advanced-expander">
+          <summary>Advanced: validation rules</summary>
+          <div class="requirement-builder">
+            <label>
+              Row
+              <input id="requirementRow" type="number" min="1" max="13" value="1" />
+            </label>
+            <label>
+              Start column
+              <input id="requirementStart" type="number" min="1" max="38" value="1" />
+            </label>
+            <label>
+              End column
+              <input id="requirementEnd" type="number" min="1" max="38" value="1" />
+            </label>
+            <label>
+              Check
+              <select id="requirementType">
+                <option value="exact">Exact text</option>
+                <option value="contains">Contains text</option>
+                <option value="fill">Fill range with character</option>
+                <option value="blank">Range must be blank</option>
+                <option value="not_contains">Must not contain text</option>
+              </select>
+            </label>
+            <label class="requirement-text-field">
+              Expected text
+              <input id="requirementText" type="text" autocomplete="off" />
+            </label>
+            <label class="toggle-label">
+              <input id="requirementIgnoreCase" type="checkbox" checked />
+              Ignore case
+            </label>
+            <label class="toggle-label">
+              <input id="requirementIgnoreSpaces" type="checkbox" />
+              Ignore extra spaces
+            </label>
+            <button id="addRequirementButton" type="button">Add Requirement</button>
+            <button id="reviewRequirementsButton" class="primary" type="button" disabled>Review All</button>
+          </div>
+          <div id="requirementList" class="requirement-list"></div>
+          <div id="requirementsSummary" class="requirements-summary" hidden></div>
+          <div id="requirementsResults" class="requirements-results" hidden></div>
+        </details>
         <div class="table-wrap">
           <table id="gridTable" aria-label="MCDU extracted 13 by 40 grid"></table>
         </div>
       </section>
     </main>
 
-    <script src="/app.js?v=hybrid-ocr"></script>
+    <script src="/app.js?v=p6-ui"></script>
   </body>
 </html>
