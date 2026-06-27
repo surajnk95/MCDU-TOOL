@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>777-9 MCDU Grid Tool</title>
-    <link rel="stylesheet" href="/styles.css?v=p6-ui" />
+    <link rel="stylesheet" href="/styles.css?v=p6-fusion" />
   </head>
   <body>
     <header class="topbar">
@@ -105,6 +105,19 @@
           <button id="refineGridButton" type="button" disabled>Focused Recheck</button>
           <div id="verificationSummary" class="verification-summary" hidden></div>
         </div>
+        <details class="advanced-expander" id="fusionPanel">
+          <summary>Multi-photo fusion</summary>
+          <div class="fusion-body">
+            <p class="fusion-hint">Analyze 2&ndash;3 shots of the same page. After each, click <strong>Add to fusion</strong>. When you have 2 or 3, click <strong>Combine</strong>.</p>
+            <div id="fusionSlotList" class="fusion-slot-list"></div>
+            <div class="fusion-controls">
+              <button id="addToFusionButton" type="button" disabled>Add current grid</button>
+              <button id="fuseButton" class="primary" type="button" disabled>Combine photos</button>
+              <button id="clearFusionButton" type="button" disabled>Clear all</button>
+            </div>
+            <div id="fusionSummary" class="fusion-summary" hidden></div>
+          </div>
+        </details>
         <details class="advanced-expander">
           <summary>Advanced: validation rules</summary>
           <div class="requirement-builder">
@@ -155,6 +168,6 @@
       </section>
     </main>
 
-    <script src="/app.js?v=p6-ui"></script>
+    <script src="/app.js?v=p6-fusion"></script>
   </body>
 </html>

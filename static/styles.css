@@ -584,6 +584,63 @@ button[data-loading]::after {
   display: none;
 }
 
+.fusion-body {
+  padding: 10px 14px 12px;
+  display: grid;
+  gap: 8px;
+}
+
+.fusion-hint {
+  margin: 0;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.fusion-slot-list {
+  display: grid;
+  gap: 4px;
+}
+
+.fusion-slot-list:empty {
+  display: none;
+}
+
+.fusion-slot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 5px 8px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: #eef4f2;
+  font-size: 12px;
+  color: var(--accent-strong);
+}
+
+.fusion-slot button {
+  flex: 0 0 auto;
+  min-height: 24px;
+  padding: 0 7px;
+  font-size: 11px;
+}
+
+.fusion-controls {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.fusion-summary {
+  padding: 7px 10px;
+  border-radius: 6px;
+  background: #eef4f2;
+  border: 1px solid #b2d0cc;
+  font-size: 12px;
+  color: var(--accent-strong);
+  font-weight: 600;
+}
+
 @media (max-width: 1100px) {
   .controls {
     grid-template-columns: repeat(2, minmax(120px, 1fr));

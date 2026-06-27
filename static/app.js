@@ -46,6 +46,11 @@ const insetInputs = {
 const blurBanner = document.querySelector("#blurBanner");
 const blurBannerDismiss = document.querySelector("#blurBannerDismiss");
 const stageHint = document.querySelector("#stageHint");
+const addToFusionButton = document.querySelector("#addToFusionButton");
+const fuseButton = document.querySelector("#fuseButton");
+const clearFusionButton = document.querySelector("#clearFusionButton");
+const fusionSlotList = document.querySelector("#fusionSlotList");
+const fusionSummary = document.querySelector("#fusionSummary");
 
 const state = {
   image: null,
@@ -64,6 +69,7 @@ const state = {
   confidenceGrid: Array.from({ length: ROWS }, () => Array.from({ length: COLS }, () => 0)),
   colorGrid: Array.from({ length: ROWS }, () => Array.from({ length: COLS }, () => "")),
   requirements: [],
+  fusionSlots: [],
 };
 
 function makeEmptyColorGrid() {
@@ -785,6 +791,7 @@ fileInput.addEventListener("change", () => {
       state.confidenceGrid = Array.from({ length: ROWS }, () => Array.from({ length: COLS }, () => 0));
       state.colorGrid = makeEmptyColorGrid();
       blurBanner.hidden = true;
+      addToFusionButton.disabled = true;
       setViewMode("photo");
       renderGridTable();
       setStatus("Image loaded");
@@ -950,6 +957,7 @@ analyzeButton.addEventListener("click", async () => {
       : "";
     const blurNote = result.blurry ? ` (blurry, score ${result.blurScore})` : "";
     setStatus(`OCR complete using ${engines}: ${boxCount} character boxes, ${result.words.length} text blocks${preprocessing}${refined}${paddleNote}${blurNote}`);
+    addToFusionButton.disabled = state.fusionSlots.length >= 3;
     setStageHint("Grid extracted — edit any cells, then Export Word File or Remember Corrections.");
   } catch (error) {
     setStatus(error.message);
@@ -1204,6 +1212,92 @@ reviewRequirementsButton.addEventListener("click", async () => {
   } finally {
     reviewRequirementsButton.disabled = false;
   }
+});
+
+function countNonEmptyCells(grid) {
+  let n = 0;
+  for (let r = 0; r < ROWS; r += 1) {
+    for (let c = FIRST_DATA_COL; c <= LAST_DATA_COL; c += 1) {
+      if (grid[r]?.[c]) n += 1;
+    }
+  }
+  return n;
+}
+
+function renderFusionSlots() {
+  fusionSlotList.textContent = "";
+  state.fusionSlots.forEach((slot, index) => {
+    const item = document.createElement("div");
+    item.className = "fusion-slot";
+    const label = document.createElement("span");
+    label.textContent = `${slot.label} — ${slot.cellCount} non-empty cell${slot.cellCount === 1 ? "" : "s"}`;
+    const removeBtn = document.createElement("button");
+    removeBtn.type = "button";
+    removeBtn.textContent = "Remove";
+    removeBtn.addEventListener("click", () => {
+      state.fusionSlots.splice(index, 1);
+      renderFusionSlots();
+    });
+    item.append(label, removeBtn);
+    fusionSlotList.appendChild(item);
+  });
+
+  const count = state.fusionSlots.length;
+  addToFusionButton.disabled = count >= 3;
+  fuseButton.disabled = count < 2;
+  clearFusionButton.disabled = count === 0;
+  if (count === 0) {
+    fusionSummary.hidden = true;
+  }
+}
+
+addToFusionButton.addEventListener("click", () => {
+  const grid = getCurrentGrid();
+  const cellCount = countNonEmptyCells(grid);
+  const label = `Photo ${state.fusionSlots.length + 1}`;
+  state.fusionSlots.push({ label, grid, cellCount });
+  renderFusionSlots();
+  setStatus(`${label} added to fusion (${state.fusionSlots.length}/3 ready)`);
+});
+
+fuseButton.addEventListener("click", async () => {
+  fuseButton.disabled = true;
+  fuseButton.dataset.loading = "true";
+  setStatus("Combining photos…");
+  try {
+    const result = await postJson("/api/fuse-grids", {
+      grids: state.fusionSlots.map((s) => s.grid),
+    });
+    const fused = normalizeGridGuards(result.grid);
+    state.sourceGrid = fused;
+    state.confidenceGrid = Array.from({ length: ROWS }, () => Array.from({ length: COLS }, () => 0));
+    state.colorGrid = makeEmptyColorGrid();
+    renderGridTable(fused, state.confidenceGrid, state.colorGrid);
+    exportButton.disabled = false;
+    rememberButton.disabled = false;
+    const f = result.fusion || {};
+    const parts = [
+      `${f.grids ?? state.fusionSlots.length} photos`,
+      `${f.agreed ?? 0} agreed`,
+      `${f.filled ?? 0} filled from one photo`,
+      `${f.conflicted ?? 0} conflicted`,
+    ];
+    fusionSummary.textContent = parts.join(" · ");
+    fusionSummary.hidden = false;
+    setStatus(`Fusion complete — ${f.conflicted ?? 0} conflicted cell${f.conflicted === 1 ? "" : "s"} to review`);
+    setStageHint("Fusion applied — review the grid, then Export Word File.");
+  } catch (error) {
+    setStatus(error.message);
+  } finally {
+    fuseButton.disabled = state.fusionSlots.length < 2;
+    delete fuseButton.dataset.loading;
+  }
+});
+
+clearFusionButton.addEventListener("click", () => {
+  state.fusionSlots = [];
+  renderFusionSlots();
+  setStatus("Fusion slots cleared");
 });
 
 blurBannerDismiss.addEventListener("click", () => {
