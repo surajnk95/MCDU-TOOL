@@ -1459,8 +1459,19 @@ def probe_orientation(image: Image.Image) -> int:
 def clean_ocr_text(text: str) -> str:
     text = text.replace("|", "I")
     text = text.replace("º", "°").replace("˚", "°").replace("Â°", "°")
+    # Heading / position format, e.g. "000°/0.0NM" — recover a degree that OCR
+    # either dropped or misread as o/O before the "/<dist>NM" tail.
     text = re.sub(r"(?<=\d{3})[oO](?=/\d+(?:\.\d+)(?:NM)?\b)", "°", text)
     text = re.sub(r"\b(\d{3})(?=/\d+(?:\.\d+)(?:NM)?\b)", r"\1°", text)
+    # Course / track headings, e.g. "217°TRK" — the degree sits between a
+    # 3-digit value and TRK and is often dropped or read as o/O/0.
+    text = re.sub(r"\b(\d{3})[oO0]?(?=TRK\b)", r"\1°", text)
+    # Glidepath angle, e.g. "3.00°" — a degree misread as the letter o/O right
+    # after a single-digit decimal (digit 0 is left alone as it is ambiguous).
+    text = re.sub(r"\b(\d\.\d{2})[oO]\b", r"\1°", text)
+    # Standalone course value, e.g. "268°" — a trailing degree read as o/O at a
+    # word boundary. Restricted to the letter o/O so real numbers are untouched.
+    text = re.sub(r"\b(\d{3})[oO]\b", r"\1°", text)
     text = re.sub(r"\s+", " ", text)
     return text.strip()
 

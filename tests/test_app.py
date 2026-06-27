@@ -27,6 +27,30 @@ class OcrNormalizationTests(unittest.TestCase):
         self.assertEqual(app.clean_ocr_text("000/0.0NM"), "000°/0.0NM")
         self.assertEqual(app.clean_ocr_text("000O/0.0NM"), "000°/0.0NM")
 
+    def test_track_heading_recovers_degree(self) -> None:
+        # LEGS/RTE page: "217°TRK" — degree dropped or misread before TRK.
+        self.assertEqual(app.clean_ocr_text("217TRK"), "217°TRK")
+        self.assertEqual(app.clean_ocr_text("217oTRK"), "217°TRK")
+        self.assertEqual(app.clean_ocr_text("217°TRK"), "217°TRK")
+
+    def test_standalone_course_recovers_degree(self) -> None:
+        # LEGS page course column: "268°" with the degree read as the letter o/O.
+        self.assertEqual(app.clean_ocr_text("268o"), "268°")
+        self.assertEqual(app.clean_ocr_text("268O"), "268°")
+        self.assertEqual(app.clean_ocr_text("268°"), "268°")
+
+    def test_glidepath_angle_recovers_degree(self) -> None:
+        # Descent legs: "GP 3.00°" — degree misread as letter o after the angle.
+        self.assertEqual(app.clean_ocr_text("3.00o"), "3.00°")
+        self.assertEqual(app.clean_ocr_text("3.00°"), "3.00°")
+
+    def test_plain_numbers_are_not_given_a_degree(self) -> None:
+        # Speeds/altitudes/distances must never gain a spurious degree.
+        self.assertEqual(app.clean_ocr_text("180"), "180")
+        self.assertEqual(app.clean_ocr_text("2680"), "2680")
+        self.assertEqual(app.clean_ocr_text("FL204"), "FL204")
+        self.assertEqual(app.clean_ocr_text("60NM"), "60NM")
+
     def test_common_mcdu_compounds_recover_spacing(self) -> None:
         self.assertEqual(app.normalize_mcdu_phrase("TOFL204"), "TO FL204")
         self.assertEqual(app.normalize_mcdu_phrase("KBFIETA/FUEL"), "KBFI ETA/FUEL")
