@@ -8,7 +8,7 @@ from unittest.mock import patch
 
 import app
 import numpy as np
-from PIL import Image, ImageDraw, ImageOps
+from PIL import Image, ImageDraw, ImageFilter, ImageOps
 
 
 def grid_with_row(text: str, row: int = 0) -> list[list[str]]:
@@ -1124,6 +1124,103 @@ class TemplateMatcherTests(unittest.TestCase):
         dist_same = app.feature_distance(feat_a, feat_b)
         dist_diff = app.feature_distance(feat_a, feat_c)
         self.assertLess(dist_same, dist_diff, "Similar glyphs should be closer than dissimilar ones")
+
+
+class BlurScoreTests(unittest.TestCase):
+    def _sharp_image(self) -> Image.Image:
+        img = Image.new("RGB", (400, 300), (0, 0, 0))
+        draw = ImageDraw.Draw(img)
+        for x in range(0, 400, 8):
+            draw.line((x, 0, x, 300), fill=(200, 200, 200), width=1)
+        return img
+
+    def _blurry_image(self) -> Image.Image:
+        sharp = self._sharp_image()
+        return sharp.filter(ImageFilter.GaussianBlur(radius=6))
+
+    def test_sharp_image_returns_positive(self):
+        score = app.compute_blur_score(self._sharp_image())
+        self.assertGreater(score, 0.0)
+
+    def test_blurry_image_below_threshold(self):
+        score = app.compute_blur_score(self._blurry_image())
+        self.assertLess(score, app.BLUR_THRESHOLD)
+
+    def test_sharp_scores_higher_than_blurry(self):
+        sharp_score = app.compute_blur_score(self._sharp_image())
+        blurry_score = app.compute_blur_score(self._blurry_image())
+        self.assertGreater(sharp_score, blurry_score)
+
+
+class FuseGridsTests(unittest.TestCase):
+    def _make_grid(self, fill: str = "") -> list[list[str]]:
+        g = app.empty_grid()
+        if fill:
+            for r in range(app.ROWS):
+                for c in range(app.FIRST_DATA_COL, app.LAST_DATA_COL + 1):
+                    g[r][c] = fill
+        return g
+
+    def _set_cell(self, g, row, col, ch):
+        g[row][col] = ch
+        return g
+
+    def test_all_agree(self):
+        g1 = self._set_cell(self._make_grid(), 2, 5, "A")
+        g2 = self._set_cell(self._make_grid(), 2, 5, "A")
+        g3 = self._set_cell(self._make_grid(), 2, 5, "A")
+        fused, summary = app.fuse_grids([g1, g2, g3])
+        self.assertEqual(fused[2][5], "A")
+        self.assertEqual(summary["agreed"], 1)
+        self.assertEqual(summary["conflicted"], 0)
+
+    def test_majority_wins(self):
+        g1 = self._set_cell(self._make_grid(), 3, 10, "B")
+        g2 = self._set_cell(self._make_grid(), 3, 10, "B")
+        g3 = self._set_cell(self._make_grid(), 3, 10, "8")
+        fused, summary = app.fuse_grids([g1, g2, g3])
+        self.assertEqual(fused[3][10], "B")
+        self.assertEqual(summary["conflicted"], 1)
+
+    def test_fill_from_single_grid(self):
+        g1 = self._make_grid()
+        g2 = self._set_cell(self._make_grid(), 5, 7, "X")
+        fused, summary = app.fuse_grids([g1, g2])
+        self.assertEqual(fused[5][7], "X")
+        self.assertEqual(summary["filled"], 1)
+
+    def test_all_empty_cell_stays_empty(self):
+        g1 = self._make_grid()
+        g2 = self._make_grid()
+        fused, summary = app.fuse_grids([g1, g2])
+        self.assertEqual(fused[0][0], "")
+        self.assertGreater(summary["empty"], 0)
+
+    def test_output_dimensions(self):
+        g1 = self._make_grid()
+        g2 = self._make_grid()
+        fused, _ = app.fuse_grids([g1, g2])
+        self.assertEqual(len(fused), app.ROWS)
+        self.assertTrue(all(len(row) == app.COLS for row in fused))
+
+    def test_guard_columns_preserved(self):
+        g1 = self._make_grid("Z")
+        g2 = self._make_grid("Z")
+        fused, _ = app.fuse_grids([g1, g2])
+        for row in fused:
+            self.assertEqual(row[0], "")
+            self.assertEqual(row[app.COLS - 1], "")
+
+    def test_requires_two_or_more_grids(self):
+        with self.assertRaises((ValueError, Exception)):
+            app.fuse_grids([self._make_grid()])
+
+    def test_summary_grids_count(self):
+        g1 = self._make_grid()
+        g2 = self._make_grid()
+        g3 = self._make_grid()
+        _, summary = app.fuse_grids([g1, g2, g3])
+        self.assertEqual(summary["grids"], 3)
 
 
 if __name__ == "__main__":

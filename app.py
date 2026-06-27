@@ -60,6 +60,7 @@ MAX_SCREEN_H = 1400
 OCR_WHITELIST = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789°º˚/.-<>%:"
 MAX_REQUEST_BYTES = 50 * 1024 * 1024
 MAX_EXPORT_FILES = 80
+BLUR_THRESHOLD = 80.0   # variance-of-Laplacian below this → warn "image too blurry" (#25)
 EXPORT_MAX_AGE_SECONDS = 7 * 24 * 60 * 60
 MCDU_WORD_HINTS = {
     "ACT",
@@ -2847,7 +2848,69 @@ def recover_dash_lines(grid: list[list[str]], warped: Image.Image) -> list[list[
 # ---------------------------------------------------------------------------
 # #22 — Per-field format validator
 # #23 — Color-semantics extraction
+# #25 — Blur / quality gate
 # ---------------------------------------------------------------------------
+
+
+def compute_blur_score(warped: Image.Image) -> float:
+    """Variance-of-Laplacian blur metric for the warped screen (#25).
+
+    Returns a non-negative float — higher means sharper.  Values below
+    BLUR_THRESHOLD (~80) indicate that the image may be too blurry for reliable
+    OCR.  Returns 0.0 when OpenCV is not available.
+    """
+    try:
+        import cv2
+    except ImportError:
+        return 0.0
+    gray = np.asarray(ImageOps.grayscale(warped), dtype=np.uint8)
+    laplacian = cv2.Laplacian(gray, cv2.CV_64F)
+    return float(laplacian.var())
+
+
+def fuse_grids(grids: list[list[list[str]]]) -> tuple[list[list[str]], dict[str, Any]]:
+    """Majority-vote fusion across 2–3 pre-analyzed grids (#24).
+
+    For each cell, collects the non-empty votes from all grids and picks
+    the most frequent character.  If only one grid is non-empty that value
+    wins (fill-in).  When all grids are empty the cell stays empty.
+
+    Returns ``(fused_grid, summary)`` where summary counts agreed / filled /
+    conflicted / empty cells across the whole grid.
+    """
+    if len(grids) < 2:
+        raise ValueError("At least two grids are required for fusion.")
+    for g in grids:
+        if len(g) != ROWS or any(len(row) != COLS for row in g):
+            raise ValueError(f"All grids must be {ROWS}×{COLS}.")
+
+    fused: list[list[str]] = empty_grid()
+    agreed = filled = conflicted = empty = 0
+
+    for row in range(ROWS):
+        for col in range(COLS):
+            votes = [g[row][col] for g in grids if g[row][col]]
+            if not votes:
+                empty += 1
+                continue
+            best = max(set(votes), key=votes.count)
+            fused[row][col] = best
+            if len(set(votes)) == 1:
+                if len(votes) == len(grids):
+                    agreed += 1
+                else:
+                    filled += 1
+            else:
+                conflicted += 1
+
+    summary = {
+        "grids": len(grids),
+        "agreed": agreed,
+        "filled": filled,
+        "conflicted": conflicted,
+        "empty": empty,
+    }
+    return fused, summary
 
 
 def _snap_fl_token(text: str) -> str | None:
@@ -3049,6 +3112,7 @@ def analyze(payload: dict[str, Any]) -> dict[str, Any]:
 
     warped = warp_screen(image, corners)
     warped = clean_warped_image(warped)  # #14/#15/#17: cursor / glare / outlines
+    blur_score = compute_blur_score(warped)  # #25: quality gate
     screen_size = warped.size
     ocr_candidates: list[tuple[float, str, Image.Image, list[dict[str, Any]]]] = []
     for variant_name, variant_image in preprocessing_variants(warped):
@@ -3162,6 +3226,8 @@ def analyze(payload: dict[str, Any]) -> dict[str, Any]:
         },
         "previewUrl": f"/data/exports/{preview_id}",
         "verification": verification_summary,
+        "blurScore": round(blur_score, 1),
+        "blurry": blur_score > 0 and blur_score < BLUR_THRESHOLD,
     }
 
 
@@ -3272,6 +3338,25 @@ def grid_row_from_payload(grid: list[Any], row: int) -> str:
     return fixed_row_text("".join(cell or " " for cell in cells))
 
 
+def fuse_photos(payload: dict[str, Any]) -> dict[str, Any]:
+    """API wrapper for /api/fuse-grids (#24).
+
+    Expects ``{"grids": [grid1, grid2, ...]}`` where each grid is a 13×40
+    list of lists.  Accepts 2–3 grids.
+    """
+    raw = payload.get("grids")
+    if not isinstance(raw, list) or not (2 <= len(raw) <= 3):
+        raise ValueError("Provide 2 or 3 grids in the 'grids' list.")
+    for i, g in enumerate(raw):
+        if not isinstance(g, list) or len(g) != ROWS:
+            raise ValueError(f"Grid {i} must have {ROWS} rows.")
+        for j, row in enumerate(g):
+            if not isinstance(row, list) or len(row) != COLS:
+                raise ValueError(f"Grid {i}, row {j} must have {COLS} columns.")
+    fused, summary = fuse_grids(raw)
+    return {"grid": fused, "fusion": summary}
+
+
 class McmduHandler(SimpleHTTPRequestHandler):
     def end_headers(self) -> None:
         self.send_header("Cache-Control", "no-store, no-cache, must-revalidate")
@@ -3311,6 +3396,8 @@ class McmduHandler(SimpleHTTPRequestHandler):
                 json_response(self, HTTPStatus.OK, review_requirements(payload))
             elif self.path == "/api/refine-grid":
                 json_response(self, HTTPStatus.OK, refine_grid(payload))
+            elif self.path == "/api/fuse-grids":
+                json_response(self, HTTPStatus.OK, fuse_photos(payload))
             else:
                 json_response(self, HTTPStatus.NOT_FOUND, {"error": "Unknown endpoint."})
         except Exception as exc:  # noqa: BLE001 - API boundary should return useful errors.
