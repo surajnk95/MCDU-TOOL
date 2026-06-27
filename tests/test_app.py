@@ -826,6 +826,192 @@ class PerRowStripOcrTests(unittest.TestCase):
         self.assertEqual(len(grid), app.ROWS)
 
 
+class FieldValidatorTests(unittest.TestCase):
+    """Tests for _snap_fl_token, _snap_decimal_token, and validate_field_formats (#22)."""
+
+    # --- _snap_fl_token ---
+
+    def test_snap_fl_correct_token_returns_none(self) -> None:
+        self.assertIsNone(app._snap_fl_token("FL204"))
+        self.assertIsNone(app._snap_fl_token("FL89"))
+        self.assertIsNone(app._snap_fl_token("FL350"))
+
+    def test_snap_fl_fixes_second_char_substitution(self) -> None:
+        # L → I (very common on some fonts)
+        self.assertEqual(app._snap_fl_token("FI204"), "FL204")
+        self.assertEqual(app._snap_fl_token("F1350"), "FL350")
+
+    def test_snap_fl_fixes_first_char_substitution(self) -> None:
+        # F → E (serifs can cause E↔F confusion)
+        self.assertEqual(app._snap_fl_token("EL204"), "FL204")
+        self.assertEqual(app._snap_fl_token("PL350"), "FL350")
+
+    def test_snap_fl_rejects_unrelated_tokens(self) -> None:
+        self.assertIsNone(app._snap_fl_token("ECON"))
+        self.assertIsNone(app._snap_fl_token(".860"))
+        self.assertIsNone(app._snap_fl_token("FL"))       # too short
+        self.assertIsNone(app._snap_fl_token("EL2"))      # only 1 digit (too short)
+        self.assertIsNone(app._snap_fl_token("ABCDE"))    # not FL-like
+
+    def test_snap_fl_preserves_length(self) -> None:
+        result = app._snap_fl_token("EL204")
+        self.assertIsNotNone(result)
+        self.assertEqual(len(result), len("EL204"))  # type: ignore[arg-type]
+
+    # --- _snap_decimal_token ---
+
+    def test_snap_decimal_correct_token_returns_none(self) -> None:
+        self.assertIsNone(app._snap_decimal_token(".860"))
+        self.assertIsNone(app._snap_decimal_token(".840"))
+
+    def test_snap_decimal_fixes_comma(self) -> None:
+        self.assertEqual(app._snap_decimal_token(",860"), ".860")
+        self.assertEqual(app._snap_decimal_token(",840"), ".840")
+
+    def test_snap_decimal_rejects_unrelated(self) -> None:
+        self.assertIsNone(app._snap_decimal_token("ECON"))
+        self.assertIsNone(app._snap_decimal_token("FL350"))
+        self.assertIsNone(app._snap_decimal_token(".86"))    # only 2 digits
+        self.assertIsNone(app._snap_decimal_token("860"))   # missing dot (length change)
+
+    # --- validate_field_formats ---
+
+    def _make_grid_with_tokens(self, row_tokens: dict[int, list[tuple[int, str]]]) -> list[list[str]]:
+        """Build a 13×40 grid with specific tokens at (row, start_col)."""
+        grid = app.empty_grid()
+        for row, tokens in row_tokens.items():
+            for start_col, text in tokens:
+                for i, ch in enumerate(text):
+                    if app.FIRST_DATA_COL <= start_col + i <= app.LAST_DATA_COL:
+                        grid[row][start_col + i] = ch
+        return grid
+
+    def test_validate_standalone_fl_snapping(self) -> None:
+        grid = self._make_grid_with_tokens({2: [(5, "FI204")]})
+        result = app.validate_field_formats(grid)
+        self.assertEqual("".join(result[2][5:10]).rstrip(), "FL204")
+
+    def test_validate_standalone_decimal_snapping(self) -> None:
+        grid = self._make_grid_with_tokens({4: [(20, ",860")]})
+        result = app.validate_field_formats(grid)
+        self.assertEqual("".join(result[4][20:24]), ".860")
+
+    def test_validate_label_driven_fl_from_crz_alt(self) -> None:
+        # Label row 1: "CRZ ALT", data row 2: "EL350"
+        grid = self._make_grid_with_tokens({
+            1: [(2, "CRZ"), (6, "ALT")],
+            2: [(2, "EL350")],
+        })
+        result = app.validate_field_formats(grid)
+        self.assertEqual("".join(result[2][2:7]), "FL350")
+
+    def test_validate_label_driven_spd_from_econ_spd(self) -> None:
+        # Label row 3: "ECON SPD", data row 4: ",840"
+        grid = self._make_grid_with_tokens({
+            3: [(2, "ECON"), (7, "SPD")],
+            4: [(2, ",840")],
+        })
+        result = app.validate_field_formats(grid)
+        self.assertEqual("".join(result[4][2:6]), ".840")
+
+    def test_validate_noop_on_already_correct(self) -> None:
+        grid = self._make_grid_with_tokens({
+            1: [(2, "CRZ"), (6, "ALT")],
+            2: [(2, "FL350"), (10, ".840")],
+        })
+        result = app.validate_field_formats(grid)
+        self.assertEqual("".join(result[2][2:7]), "FL350")
+        self.assertEqual("".join(result[2][10:14]), ".840")
+
+    def test_validate_does_not_touch_guard_columns(self) -> None:
+        grid = app.empty_grid()
+        result = app.validate_field_formats(grid)
+        for row in range(app.ROWS):
+            self.assertEqual(result[row][0], "")
+            self.assertEqual(result[row][app.COLS - 1], "")
+
+
+class ColorSemanticsTests(unittest.TestCase):
+    """Tests for _classify_cell_color and extract_color_semantics (#23)."""
+
+    def test_classify_magenta(self) -> None:
+        # OpenCV HSV magenta: H=150, S=255, V=255
+        crop = np.zeros((8, 6, 3), dtype=np.uint8)
+        crop[:, :, 0] = 150
+        crop[:, :, 1] = 255
+        crop[:, :, 2] = 255
+        self.assertEqual(app._classify_cell_color(crop), "magenta")
+
+    def test_classify_white(self) -> None:
+        # White: H=0, S=0, V=255
+        crop = np.zeros((8, 6, 3), dtype=np.uint8)
+        crop[:, :, 1] = 0
+        crop[:, :, 2] = 255
+        self.assertEqual(app._classify_cell_color(crop), "white")
+
+    def test_classify_cyan(self) -> None:
+        # Cyan: H=90, S=255, V=255
+        crop = np.zeros((8, 6, 3), dtype=np.uint8)
+        crop[:, :, 0] = 90
+        crop[:, :, 1] = 255
+        crop[:, :, 2] = 255
+        self.assertEqual(app._classify_cell_color(crop), "cyan")
+
+    def test_classify_amber(self) -> None:
+        # Amber/yellow: H=25, S=255, V=255
+        crop = np.zeros((8, 6, 3), dtype=np.uint8)
+        crop[:, :, 0] = 25
+        crop[:, :, 1] = 255
+        crop[:, :, 2] = 255
+        self.assertEqual(app._classify_cell_color(crop), "amber")
+
+    def test_classify_dark_cell_returns_empty(self) -> None:
+        # All-dark: V=50 (below 120 threshold)
+        crop = np.zeros((8, 6, 3), dtype=np.uint8)
+        crop[:, :, 2] = 50
+        self.assertEqual(app._classify_cell_color(crop), "")
+
+    def test_extract_color_semantics_dimensions(self) -> None:
+        warped = Image.new("RGB", (1600, 1040), (0, 0, 0))
+        grid = app.empty_grid()
+        result = app.extract_color_semantics(warped, grid)
+        self.assertEqual(len(result), app.ROWS)
+        for row in result:
+            self.assertEqual(len(row), app.COLS)
+
+    def test_extract_color_semantics_empty_cells_are_blank(self) -> None:
+        warped = Image.new("RGB", (1600, 1040), (0, 0, 0))
+        grid = app.empty_grid()  # all cells empty
+        result = app.extract_color_semantics(warped, grid)
+        for row in result:
+            for cell in row:
+                self.assertEqual(cell, "")
+
+    def test_extract_color_semantics_identifies_magenta_cell(self) -> None:
+        # Draw a magenta rectangle in cell (2, 5)
+        img = Image.new("RGB", (1600, 1040), (0, 0, 0))
+        draw = ImageDraw.Draw(img)
+        cell_w = 1600 / app.COLS
+        cell_h = 1040 / app.ROWS
+        x1 = int(5 * cell_w) + 2
+        y1 = int(2 * cell_h) + 2
+        x2 = int(6 * cell_w) - 2
+        y2 = int(3 * cell_h) - 2
+        draw.rectangle((x1, y1, x2, y2), fill=(220, 0, 220))  # magenta
+        grid = app.empty_grid()
+        grid[2][5] = "A"  # cell must be non-empty to get a color label
+        result = app.extract_color_semantics(img, grid)
+        self.assertEqual(result[2][5], "magenta")
+
+    def test_extract_color_semantics_guard_columns_are_blank(self) -> None:
+        warped = Image.new("RGB", (1600, 1040), (255, 255, 255))
+        grid = app.empty_grid()
+        result = app.extract_color_semantics(warped, grid)
+        for row in range(app.ROWS):
+            self.assertEqual(result[row][0], "")
+            self.assertEqual(result[row][app.COLS - 1], "")
+
+
 class TesseractConfigTests(unittest.TestCase):
     """Tests for shared Tesseract flags added by _tesseract_extra_args (#19/#20)."""
 

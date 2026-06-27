@@ -2844,6 +2844,163 @@ def recover_dash_lines(grid: list[list[str]], warped: Image.Image) -> list[list[
     return normalize_grid_guards(updated)
 
 
+# ---------------------------------------------------------------------------
+# #22 — Per-field format validator
+# #23 — Color-semantics extraction
+# ---------------------------------------------------------------------------
+
+
+def _snap_fl_token(text: str) -> str | None:
+    """Snap to FL\\d{2,3} via one-character substitution; None if not applicable.
+
+    Covers first-char confusions (E/P/T → F) and second-char confusions
+    (I/1/J → L).  Only same-length corrections are returned so column
+    alignment is always preserved.
+    """
+    if re.fullmatch(r"FL[0-9]{2,3}", text):
+        return None
+    if re.fullmatch(r"F[A-Z1][0-9]{2,3}", text):   # wrong second char
+        return "FL" + text[2:]
+    if re.fullmatch(r"[A-EG-Z]L[0-9]{2,3}", text):  # wrong first char
+        return "FL" + text[2:]
+    return None
+
+
+def _snap_decimal_token(text: str) -> str | None:
+    """Snap to .\\d{3} via one-character substitution; None if not applicable.
+
+    Fixes comma-instead-of-dot, the most common OCR error for Mach speeds.
+    """
+    if re.fullmatch(r"\.[0-9]{3}", text):
+        return None
+    if re.fullmatch(r",[0-9]{3}", text):
+        return "." + text[1:]
+    return None
+
+
+def validate_field_formats(grid: list[list[str]]) -> list[list[str]]:
+    """Apply one-edit format corrections guided by row-label context (#22).
+
+    Two passes:
+    1. Standalone — snap FL-like tokens whose first or second character was
+       substituted, and snap comma-for-dot decimal tokens.  Safe to apply
+       without label context because no valid MCDU token looks like
+       ``[A-Z]L\\d{2,3}`` except an FL altitude.
+    2. Label-driven — when the previous row contains an altitude label
+       (CRZ / OPT / MAX / RECMD) or a speed label (ECON / LRC / SEL / RTA
+       SPD), re-run the corresponding validator on all tokens in the current
+       row.  This covers the common 777-9 layout where labels and values
+       appear on consecutive rows.
+    """
+    updated = [[cell for cell in row] for row in grid]
+
+    def get_tokens(r: int) -> list[tuple[int, str]]:
+        result: list[tuple[int, str]] = []
+        col = FIRST_DATA_COL
+        while col <= LAST_DATA_COL:
+            if not updated[r][col]:
+                col += 1
+                continue
+            start = col
+            chars: list[str] = []
+            while col <= LAST_DATA_COL and updated[r][col]:
+                chars.append(updated[r][col])
+                col += 1
+            result.append((start, "".join(chars)))
+        return result
+
+    def apply_snap(r: int, start: int, old: str, new: str) -> None:
+        if not new or new == old or len(new) != len(old):
+            return
+        for i, ch in enumerate(new):
+            updated[r][start + i] = ch
+
+    _alt_re = re.compile(r"\b(?:CRZ|OPT|MAX|RECMD)\b")
+    _spd_re = re.compile(
+        r"\b(?:ECON|LRC|SEL|RTA)\s*SPD\b|\bSPD\s*(?:ECON|LRC|SEL|RTA)\b"
+    )
+
+    # Pass 1: standalone token-level snapping (no label context needed)
+    for row in range(ROWS):
+        for start, token in get_tokens(row):
+            snapped = _snap_fl_token(token) or _snap_decimal_token(token)
+            if snapped:
+                apply_snap(row, start, token, snapped)
+
+    # Pass 2: label-driven validation (label on row N → value on row N+1)
+    for row in range(1, ROWS):
+        label_text = " ".join(t for _, t in get_tokens(row - 1))
+        if _alt_re.search(label_text):
+            for start, token in get_tokens(row):
+                snapped = _snap_fl_token(token)
+                if snapped:
+                    apply_snap(row, start, token, snapped)
+        elif _spd_re.search(label_text):
+            for start, token in get_tokens(row):
+                snapped = _snap_decimal_token(token)
+                if snapped:
+                    apply_snap(row, start, token, snapped)
+
+    return updated
+
+
+def _classify_cell_color(hsv_crop: np.ndarray) -> str:
+    """Return the dominant text color in a cell's HSV crop (#23).
+
+    Looks only at bright pixels (V > 120) which represent text, not the dark
+    background.  Returns one of "white", "magenta", "cyan", "amber", or "".
+    """
+    v_mask = hsv_crop[:, :, 2] > 120
+    if not np.any(v_mask):
+        return ""
+    saturations = hsv_crop[:, :, 1][v_mask].astype(np.float32)
+    if float(np.mean(saturations)) < 45:
+        return "white"
+    hues = hsv_crop[:, :, 0][v_mask].astype(np.float32)
+    median_hue = float(np.median(hues))
+    if median_hue >= 130:
+        return "magenta"
+    if 80 <= median_hue < 130:
+        return "cyan"
+    if 15 <= median_hue < 80:
+        return "amber"
+    return "white"
+
+
+def extract_color_semantics(warped: Image.Image, grid: list[list[str]]) -> list[list[str]]:
+    """Return a color-label grid for each non-empty cell in the OCR result (#23).
+
+    Each non-empty cell is labelled "white", "magenta", "cyan", "amber", or "".
+    Magenta = modified/active value; cyan = boxed/selected; amber = caution.
+    Returns an all-empty grid when OpenCV is not available.
+    """
+    try:
+        import cv2
+    except ImportError:
+        return [[""] * COLS for _ in range(ROWS)]
+
+    rgb = np.asarray(warped.convert("RGB"), dtype=np.uint8)
+    hsv = cv2.cvtColor(rgb, cv2.COLOR_RGB2HSV)
+    img_h, img_w = rgb.shape[:2]
+    cell_w = img_w / COLS
+    cell_h = img_h / ROWS
+
+    color_grid: list[list[str]] = [[""] * COLS for _ in range(ROWS)]
+    for row in range(ROWS):
+        for col in range(FIRST_DATA_COL, LAST_DATA_COL + 1):
+            if not grid[row][col]:
+                continue
+            x1 = int(col * cell_w)
+            x2 = int((col + 1) * cell_w)
+            y1 = int(row * cell_h)
+            y2 = int((row + 1) * cell_h)
+            crop = hsv[max(0, y1) : min(img_h, y2), max(0, x1) : min(img_w, x2)]
+            if crop.size == 0:
+                continue
+            color_grid[row][col] = _classify_cell_color(crop)
+    return color_grid
+
+
 def remember_templates(payload: dict[str, Any]) -> dict[str, Any]:
     image = load_image(str(payload["image"]))
     corners = payload.get("corners")
@@ -2970,6 +3127,7 @@ def analyze(payload: dict[str, Any]) -> dict[str, Any]:
     grid = recover_dash_lines(grid, warped)
     grid = apply_templates(grid, warped)
     grid = disambiguate_o_zero(grid)
+    grid = validate_field_formats(grid)  # #22: per-field format snapping
     corrected_grid = apply_corrections(grid)
     verification_summary = None
     verification = payload.get("verification")
@@ -2979,6 +3137,8 @@ def analyze(payload: dict[str, Any]) -> dict[str, Any]:
             corrected_grid,
             str(verification.get("mode", "conservative")),
         )
+
+    color_grid = extract_color_semantics(warped, corrected_grid)  # #23: color labels
 
     preview_id = f"{uuid.uuid4().hex}.png"
     preview_path = EXPORTS / preview_id
@@ -2990,6 +3150,7 @@ def analyze(payload: dict[str, Any]) -> dict[str, Any]:
         "boxes": boxes,
         "calibration": geometry,
         "confidenceGrid": confidence_grid,
+        "colorGrid": color_grid,
         "preprocessing": preprocessing_name,
         "rowPreprocessing": row_sources,
         "ocrEngines": {
@@ -3013,7 +3174,8 @@ def refine_grid(payload: dict[str, Any]) -> dict[str, Any]:
     warped = warp_screen(image, corners)
     warped = clean_warped_image(warped)  # #14/#15/#17: cursor / glare / outlines
     refined, summary = whole_grid_focused_recheck(warped, grid, str(payload.get("mode", "conservative")))
-    return {"grid": refined, "verification": summary}
+    color_grid = extract_color_semantics(warped, refined)  # #23: color labels
+    return {"grid": refined, "verification": summary, "colorGrid": color_grid}
 
 
 def add_table_header(table: Any) -> None:
