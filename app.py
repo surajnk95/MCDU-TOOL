@@ -1515,6 +1515,24 @@ def refine_display_corners(
     return [{"x": float(x), "y": float(y)} for x, y in refined]
 
 
+def _candidate_corners(
+    component: dict[str, Any], scale: float, small_w: int, small_h: int
+) -> list[dict[str, float]]:
+    """Apply a tiny inset to a component's bounding box, then fit corner lines."""
+    pad_x = max(1, round((component["x2"] - component["x1"]) * 0.003))
+    pad_y = max(1, round((component["y2"] - component["y1"]) * 0.003))
+    padded = dict(component)
+    padded.update(
+        {
+            "x1": max(0, component["x1"] + pad_x),
+            "y1": max(0, component["y1"] + pad_y),
+            "x2": min(small_w, component["x2"] - pad_x),
+            "y2": min(small_h, component["y2"] - pad_y),
+        }
+    )
+    return component_corners(padded, scale)
+
+
 def component_corners(component: dict[str, Any], scale: float) -> list[dict[str, float]]:
     x1 = float(component["x1"])
     y1 = float(component["y1"])
@@ -1614,53 +1632,82 @@ def detect_display(payload: dict[str, Any]) -> dict[str, Any]:
     if not components:
         raise ValueError("Could not find a dark MCDU display region.")
 
-    scored: list[tuple[float, dict[str, Any]]] = []
     image_area = small.width * small.height
+    scored: list[tuple[float, dict[str, Any], bool]] = []
     for component in components:
         width = component["x2"] - component["x1"]
         height = component["y2"] - component["y1"]
         area = width * height
         aspect = width / max(1, height)
+        # Hard filters: reject absurdly small or non-screen-shaped blobs
+        if area < image_area * 0.05 or aspect < 0.7 or aspect > 4.5:
+            continue
         touches_edge = (
             component["x1"] <= 2
             or component["y1"] <= 2
             or component["x2"] >= small.width - 2
             or component["y2"] >= small.height - 2
         )
-        if area < image_area * 0.08 or aspect < 0.9 or aspect > 3.2:
-            continue
-        score = component["count"] * min(1.0, component["fill"] * 1.4)
-        if touches_edge:
-            score *= 0.35
-        scored.append((score, component))
+        base_score = component["count"] * min(1.0, component["fill"] * 1.4)
+        # Soft bonus for aspect ratios in the MCDU landscape range (≈1.4–1.9)
+        aspect_factor = max(0.55, 1.0 - max(0.0, abs(aspect - 1.65) - 0.5) * 0.18)
+        # Completeness: edge-touching blobs are likely cut-off neighbour displays
+        completeness = 0.30 if touches_edge else 1.0
+        scored.append((base_score * aspect_factor * completeness, component, touches_edge))
 
     if not scored:
         raise ValueError("Could not isolate the black display. Drag the four corners manually.")
 
-    _, best = max(scored, key=lambda item: item[0])
-    pad_x = max(1, round((best["x2"] - best["x1"]) * 0.003))
-    pad_y = max(1, round((best["y2"] - best["y1"]) * 0.003))
-    x1 = max(0, best["x1"] + pad_x)
-    y1 = max(0, best["y1"] + pad_y)
-    x2 = min(small.width, best["x2"] - pad_x)
-    y2 = min(small.height, best["y2"] - pad_y)
-    corner_component = dict(best)
-    corner_component.update({"x1": x1, "y1": y1, "x2": x2, "y2": y2})
-    corners = component_corners(corner_component, scale)
-    small_corners = [{"x": corner["x"] * scale, "y": corner["y"] * scale} for corner in corners]
-    refined_small = refine_display_corners(small, small_corners)
-    perspective_refined = any(
-        edge_length(before, after) > 1.5 for before, after in zip(small_corners, refined_small)
-    )
-    corners = [{"x": corner["x"] / scale, "y": corner["y"] / scale} for corner in refined_small]
-    display_width = (edge_length(corners[0], corners[1]) + edge_length(corners[3], corners[2])) * 0.5
-    display_height = (edge_length(corners[0], corners[3]) + edge_length(corners[1], corners[2])) * 0.5
-    inv = 1 / scale
+    scored.sort(key=lambda item: -item[0])
+    best_score = scored[0][0]
+
+    # Keep candidates with at least 12 % of the top score, capped at 6
+    candidates_raw = [
+        entry for entry in scored[:6] if entry[0] >= best_score * 0.12
+    ]
+
+    # Build candidate descriptors: component_corners for all, Hough refinement only for best
+    candidates: list[dict[str, Any]] = []
+    perspective_refined = False
+    for i, (score, component, touches_edge) in enumerate(candidates_raw):
+        corners = _candidate_corners(component, scale, small.width, small.height)
+        if i == 0:
+            small_corners = [{"x": c["x"] * scale, "y": c["y"] * scale} for c in corners]
+            refined_small = refine_display_corners(small, small_corners)
+            perspective_refined = any(
+                edge_length(before, after) > 1.5
+                for before, after in zip(small_corners, refined_small)
+            )
+            corners = [{"x": c["x"] / scale, "y": c["y"] / scale} for c in refined_small]
+        candidates.append(
+            {
+                "corners": corners,
+                "confidence": round(float(component["fill"]), 3),
+                "score": round(score, 1),
+                "boundingBox": {
+                    "x": round(component["x1"] / scale),
+                    "y": round(component["y1"] / scale),
+                    "width": round((component["x2"] - component["x1"]) / scale),
+                    "height": round((component["y2"] - component["y1"]) / scale),
+                },
+                "touchesEdge": touches_edge,
+            }
+        )
+
+    best_corners = candidates[0]["corners"]
+    display_width = (
+        edge_length(best_corners[0], best_corners[1]) + edge_length(best_corners[3], best_corners[2])
+    ) * 0.5
+    display_height = (
+        edge_length(best_corners[0], best_corners[3]) + edge_length(best_corners[1], best_corners[2])
+    ) * 0.5
     return {
-        "corners": corners,
-        "confidence": round(float(best["fill"]), 3),
+        "corners": best_corners,
+        "confidence": candidates[0]["confidence"],
         "perspectiveRefined": perspective_refined,
         "displaySize": {"width": round(display_width), "height": round(display_height)},
+        "candidates": candidates,
+        "bestIndex": 0,
     }
 
 

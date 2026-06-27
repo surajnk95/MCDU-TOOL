@@ -1,3 +1,5 @@
+import base64
+import io
 import math
 import tempfile
 import unittest
@@ -456,6 +458,83 @@ class PreprocessingTests(unittest.TestCase):
         self.assertEqual(len(feature), 16 * 24)
         # max-channel makes magenta bright (220 > 90 threshold) → non-zero mask entries
         self.assertGreater(sum(feature), 0)
+
+
+def image_to_data_url(image: Image.Image) -> str:
+    buf = io.BytesIO()
+    image.save(buf, format="PNG")
+    return "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode()
+
+
+def make_two_screen_image() -> Image.Image:
+    """400×300 image: two side-by-side dark MCDU-shaped rectangles on a gray background."""
+    img = Image.new("RGB", (400, 300), (200, 200, 200))
+    draw = ImageDraw.Draw(img)
+    draw.rectangle((10, 30, 185, 145), fill=(0, 0, 0))   # screen 1: 175×115, aspect ~1.52
+    draw.rectangle((215, 30, 390, 145), fill=(0, 0, 0))  # screen 2: 175×115, aspect ~1.52
+    return img
+
+
+def make_partial_screen_image() -> Image.Image:
+    """400×300 image: one complete screen + one screen cut off at the left edge."""
+    img = Image.new("RGB", (400, 300), (200, 200, 200))
+    draw = ImageDraw.Draw(img)
+    draw.rectangle((0, 30, 130, 145), fill=(0, 0, 0))    # cut-off: touches left edge
+    draw.rectangle((200, 30, 390, 145), fill=(0, 0, 0))  # complete: 190×115, aspect ~1.65
+    return img
+
+
+class MultiScreenDetectionTests(unittest.TestCase):
+    def test_two_screens_returns_two_candidates(self) -> None:
+        payload = {"image": image_to_data_url(make_two_screen_image())}
+        result = app.detect_display(payload)
+        self.assertIn("candidates", result)
+        self.assertGreaterEqual(len(result["candidates"]), 2)
+
+    def test_response_always_includes_corners_and_best_index(self) -> None:
+        payload = {"image": image_to_data_url(make_two_screen_image())}
+        result = app.detect_display(payload)
+        self.assertIn("corners", result)
+        self.assertIn("bestIndex", result)
+        self.assertEqual(result["bestIndex"], 0)
+        self.assertEqual(len(result["corners"]), 4)
+
+    def test_each_candidate_has_required_fields(self) -> None:
+        payload = {"image": image_to_data_url(make_two_screen_image())}
+        result = app.detect_display(payload)
+        for candidate in result["candidates"]:
+            self.assertIn("corners", candidate)
+            self.assertIn("confidence", candidate)
+            self.assertIn("boundingBox", candidate)
+            self.assertIn("touchesEdge", candidate)
+            self.assertEqual(len(candidate["corners"]), 4)
+
+    def test_edge_touching_screen_scores_lower_than_complete_screen(self) -> None:
+        payload = {"image": image_to_data_url(make_partial_screen_image())}
+        result = app.detect_display(payload)
+        self.assertGreaterEqual(len(result["candidates"]), 2)
+        edge_candidates = [c for c in result["candidates"] if c["touchesEdge"]]
+        complete_candidates = [c for c in result["candidates"] if not c["touchesEdge"]]
+        self.assertTrue(edge_candidates, "expected at least one edge-touching candidate")
+        self.assertTrue(complete_candidates, "expected at least one complete candidate")
+        best_complete = max(c["score"] for c in complete_candidates)
+        best_edge = max(c["score"] for c in edge_candidates)
+        self.assertGreater(best_complete, best_edge)
+
+    def test_auto_pick_avoids_edge_touching_screen(self) -> None:
+        payload = {"image": image_to_data_url(make_partial_screen_image())}
+        result = app.detect_display(payload)
+        best = result["candidates"][result["bestIndex"]]
+        self.assertFalse(best["touchesEdge"], "auto-pick should prefer the complete screen")
+
+    def test_single_screen_returns_one_candidate_with_best_index_zero(self) -> None:
+        img = Image.new("RGB", (400, 300), (200, 200, 200))
+        draw = ImageDraw.Draw(img)
+        draw.rectangle((50, 50, 350, 250), fill=(0, 0, 0))  # one large complete screen
+        payload = {"image": image_to_data_url(img)}
+        result = app.detect_display(payload)
+        self.assertEqual(result["bestIndex"], 0)
+        self.assertEqual(result["candidates"][0]["touchesEdge"], False)
 
 
 if __name__ == "__main__":

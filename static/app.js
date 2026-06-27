@@ -50,6 +50,8 @@ const state = {
   imageBounds: { x: 0, y: 0, width: 0, height: 0, scale: 1 },
   flatBounds: { x: 0, y: 0, width: 0, height: 0, scale: 1 },
   corners: [],
+  candidates: [],
+  selectedCandidateIndex: -1,
   dragging: -1,
   viewMode: "photo",
   sourceGrid: makeEmptyGrid(),
@@ -248,6 +250,7 @@ function draw() {
 
     drawGrid();
     drawHandles();
+    drawCandidateOutlines();
   }
 }
 
@@ -328,6 +331,67 @@ function drawHandles() {
     ctx.fillStyle = "#ffffff";
   });
   ctx.restore();
+}
+
+function isPointInQuad(corners, point) {
+  const n = corners.length;
+  let inside = false;
+  for (let i = 0, j = n - 1; i < n; j = i++) {
+    const xi = corners[i].x;
+    const yi = corners[i].y;
+    const xj = corners[j].x;
+    const yj = corners[j].y;
+    if ((yi > point.y) !== (yj > point.y) &&
+        point.x < ((xj - xi) * (point.y - yi)) / (yj - yi) + xi) {
+      inside = !inside;
+    }
+  }
+  return inside;
+}
+
+function drawCandidateOutlines() {
+  if (state.candidates.length <= 1) {
+    return;
+  }
+  ctx.save();
+  state.candidates.forEach((candidate, index) => {
+    if (index === state.selectedCandidateIndex) {
+      return;
+    }
+    const canvasCorners = candidate.corners.map(imageToCanvas);
+    ctx.strokeStyle = "#4a9ef2";
+    ctx.lineWidth = 2;
+    ctx.setLineDash([8, 5]);
+    ctx.fillStyle = "rgba(74, 158, 242, 0.12)";
+    ctx.beginPath();
+    canvasCorners.forEach((pt, i) => {
+      if (i === 0) ctx.moveTo(pt.x, pt.y);
+      else ctx.lineTo(pt.x, pt.y);
+    });
+    ctx.closePath();
+    ctx.stroke();
+    ctx.fill();
+    ctx.setLineDash([]);
+    const cx = canvasCorners.reduce((s, p) => s + p.x, 0) / 4;
+    const cy = canvasCorners.reduce((s, p) => s + p.y, 0) / 4;
+    ctx.font = "bold 14px system-ui, sans-serif";
+    ctx.textAlign = "center";
+    ctx.textBaseline = "middle";
+    ctx.fillStyle = "rgba(0,0,0,0.45)";
+    ctx.fillText(`Screen ${index + 1} — click to select`, cx, cy + 1);
+    ctx.fillStyle = "#4a9ef2";
+    ctx.fillText(`Screen ${index + 1} — click to select`, cx, cy);
+  });
+  ctx.restore();
+}
+
+function selectCandidate(index) {
+  state.selectedCandidateIndex = index;
+  setCorners(state.candidates[index].corners);
+  invalidateFlattenedDisplay();
+  draw();
+  setStatus(`Screen ${index + 1} selected — flattening`);
+  flattenDisplay(false);
 }
 
 function drawFlattenedView() {
@@ -533,6 +597,8 @@ async function autoDetectDisplay() {
     const result = await postJson("/api/detect-display", {
       image: state.imageDataUrl,
     });
+    state.candidates = Array.isArray(result.candidates) ? result.candidates : [];
+    state.selectedCandidateIndex = typeof result.bestIndex === "number" ? result.bestIndex : 0;
     if (setCorners(result.corners)) {
       Object.values(insetInputs).forEach((input) => {
         input.value = "0";
@@ -540,7 +606,10 @@ async function autoDetectDisplay() {
       draw();
       const size = result.displaySize ? ` ${result.displaySize.width}x${result.displaySize.height}` : "";
       const method = result.perspectiveRefined ? "Perspective display detected" : "Display detected";
-      setStatus(`${method}${size}`);
+      const multiNote = state.candidates.length > 1
+        ? ` — ${state.candidates.length} screens found, click another to switch`
+        : "";
+      setStatus(`${method}${size}${multiNote}`);
       await flattenDisplay(false);
       return true;
     }
@@ -616,6 +685,8 @@ fileInput.addEventListener("change", () => {
       state.flatImage = null;
       state.flatUrl = "";
       state.gridAlignment = { x: 0, y: 0 };
+      state.candidates = [];
+      state.selectedCandidateIndex = -1;
       state.confidenceGrid = Array.from({ length: ROWS }, () => Array.from({ length: COLS }, () => 0));
       setViewMode("photo");
       renderGridTable();
@@ -657,6 +728,26 @@ canvas.addEventListener("pointerup", () => {
   state.dragging = -1;
 });
 
+canvas.addEventListener("click", (event) => {
+  if (!state.image || state.viewMode !== "photo" || state.candidates.length <= 1) {
+    return;
+  }
+  const point = pointerPosition(event);
+  if (findHandle(point) >= 0) {
+    return;
+  }
+  for (let i = 0; i < state.candidates.length; i += 1) {
+    if (i === state.selectedCandidateIndex) {
+      continue;
+    }
+    const canvasCorners = state.candidates[i].corners.map(imageToCanvas);
+    if (isPointInQuad(canvasCorners, point)) {
+      selectCandidate(i);
+      return;
+    }
+  }
+});
+
 Object.values(insetInputs).forEach((input) => {
   input.addEventListener("input", () => {
     state.gridAlignment = { x: 0, y: 0 };
@@ -673,6 +764,8 @@ resetButton.addEventListener("click", () => {
   state.flatImage = null;
   state.flatUrl = "";
   state.gridAlignment = { x: 0, y: 0 };
+  state.candidates = [];
+  state.selectedCandidateIndex = -1;
   setViewMode("photo");
   Object.values(insetInputs).forEach((input) => {
     input.value = "0";
