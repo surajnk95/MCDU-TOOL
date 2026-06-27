@@ -13,6 +13,8 @@ const exportButton = document.querySelector("#exportButton");
 const rememberButton = document.querySelector("#rememberButton");
 const resetButton = document.querySelector("#resetCorners");
 const detectButton = document.querySelector("#detectButton");
+const rotateCcwButton = document.querySelector("#rotateCcwButton");
+const rotateCwButton = document.querySelector("#rotateCwButton");
 const photoViewButton = document.querySelector("#photoViewButton");
 const flatViewButton = document.querySelector("#flatViewButton");
 const gridTable = document.querySelector("#gridTable");
@@ -587,16 +589,59 @@ async function postJson(url, body) {
   return payload;
 }
 
-async function autoDetectDisplay() {
+async function applyRotation(degrees) {
+  if (!state.image || degrees === 0) {
+    return;
+  }
+  const img = state.image;
+  const swap = degrees === 90 || degrees === 270;
+  const offscreen = document.createElement("canvas");
+  offscreen.width = swap ? img.naturalHeight : img.naturalWidth;
+  offscreen.height = swap ? img.naturalWidth : img.naturalHeight;
+  const c = offscreen.getContext("2d");
+  c.translate(offscreen.width / 2, offscreen.height / 2);
+  // PIL rotate(n) is CCW; canvas rotate is CW — negate to match.
+  c.rotate((-degrees * Math.PI) / 180);
+  c.drawImage(img, -img.naturalWidth / 2, -img.naturalHeight / 2);
+  state.imageDataUrl = offscreen.toDataURL("image/jpeg", 0.92);
+  await new Promise((resolve, reject) => {
+    const newImg = new Image();
+    newImg.addEventListener("load", () => {
+      state.image = newImg;
+      state.imageBounds = calculateImageBounds();
+      resolve();
+    }, { once: true });
+    newImg.addEventListener("error", reject, { once: true });
+    newImg.src = state.imageDataUrl;
+  });
+  state.flatImage = null;
+  state.flatUrl = "";
+  state.candidates = [];
+  state.selectedCandidateIndex = -1;
+}
+
+async function autoDetectDisplay(skipOrientationProbe = false) {
   if (!state.imageDataUrl) {
     return false;
   }
   detectButton.disabled = true;
+  rotateCcwButton.disabled = true;
+  rotateCwButton.disabled = true;
   setStatus("Detecting display");
   try {
     const result = await postJson("/api/detect-display", {
       image: state.imageDataUrl,
+      skipOrientationProbe,
     });
+
+    // Auto-rotate: server probed orientation and found the image needed correction.
+    // Rotate the client image to match the rotated image the server detected on.
+    const rotation = typeof result.rotation === "number" ? result.rotation : 0;
+    if (rotation !== 0) {
+      setStatus(`Auto-rotating ${rotation}°`);
+      await applyRotation(rotation);
+    }
+
     state.candidates = Array.isArray(result.candidates) ? result.candidates : [];
     state.selectedCandidateIndex = typeof result.bestIndex === "number" ? result.bestIndex : 0;
     if (setCorners(result.corners)) {
@@ -609,7 +654,8 @@ async function autoDetectDisplay() {
       const multiNote = state.candidates.length > 1
         ? ` — ${state.candidates.length} screens found, click another to switch`
         : "";
-      setStatus(`${method}${size}${multiNote}`);
+      const rotateNote = rotation !== 0 ? ` (auto-rotated ${rotation}°)` : "";
+      setStatus(`${method}${size}${multiNote}${rotateNote}`);
       await flattenDisplay(false);
       return true;
     }
@@ -620,6 +666,8 @@ async function autoDetectDisplay() {
     setStatus(error.message);
   } finally {
     detectButton.disabled = false;
+    rotateCcwButton.disabled = !state.image;
+    rotateCwButton.disabled = !state.image;
   }
   return false;
 }
@@ -676,6 +724,8 @@ fileInput.addEventListener("change", () => {
       defaultCorners();
       emptyState.classList.add("hidden");
       detectButton.disabled = false;
+      rotateCcwButton.disabled = false;
+      rotateCwButton.disabled = false;
       photoViewButton.disabled = false;
       flatViewButton.disabled = false;
       analyzeButton.disabled = false;
@@ -776,6 +826,30 @@ resetButton.addEventListener("click", () => {
 
 detectButton.addEventListener("click", () => {
   autoDetectDisplay();
+});
+
+rotateCcwButton.addEventListener("click", async () => {
+  if (!state.image) {
+    return;
+  }
+  rotateCcwButton.disabled = true;
+  rotateCwButton.disabled = true;
+  setStatus("Rotating 90° counter-clockwise");
+  await applyRotation(90);
+  draw();
+  await autoDetectDisplay(true);
+});
+
+rotateCwButton.addEventListener("click", async () => {
+  if (!state.image) {
+    return;
+  }
+  rotateCcwButton.disabled = true;
+  rotateCwButton.disabled = true;
+  setStatus("Rotating 90° clockwise");
+  await applyRotation(270);
+  draw();
+  await autoDetectDisplay(true);
 });
 
 photoViewButton.addEventListener("click", () => {

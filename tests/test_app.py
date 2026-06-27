@@ -484,6 +484,46 @@ def make_partial_screen_image() -> Image.Image:
     return img
 
 
+class OrientationTests(unittest.TestCase):
+    def test_probe_orientation_returns_valid_angle(self) -> None:
+        img = Image.new("RGB", (120, 90), (200, 200, 200))
+        draw = ImageDraw.Draw(img)
+        draw.rectangle((5, 5, 115, 85), fill=(0, 0, 0))
+        result = app.probe_orientation(img)
+        self.assertIn(result, (0, 90, 180, 270))
+
+    def test_probe_orientation_returns_zero_when_all_scores_equal(self) -> None:
+        # Uniform dark image — all orientations score 0; default 0 should be returned.
+        img = Image.new("RGB", (100, 100), (0, 0, 0))
+        result = app.probe_orientation(img)
+        self.assertEqual(result, 0)
+
+    def test_detect_display_includes_rotation_field(self) -> None:
+        img = Image.new("RGB", (400, 300), (200, 200, 200))
+        draw = ImageDraw.Draw(img)
+        draw.rectangle((50, 50, 350, 250), fill=(0, 0, 0))
+        result = app.detect_display({"image": image_to_data_url(img)})
+        self.assertIn("rotation", result)
+        self.assertIn(result["rotation"], (0, 90, 180, 270))
+
+    def test_skip_orientation_probe_returns_rotation_zero(self) -> None:
+        img = Image.new("RGB", (400, 300), (200, 200, 200))
+        draw = ImageDraw.Draw(img)
+        draw.rectangle((50, 50, 350, 250), fill=(0, 0, 0))
+        result = app.detect_display(
+            {"image": image_to_data_url(img), "skipOrientationProbe": True}
+        )
+        self.assertEqual(result["rotation"], 0)
+
+    def test_exif_transpose_already_applied_in_load_image(self) -> None:
+        # load_image wraps exif_transpose, so a pure RGB image (no EXIF) must come
+        # back as RGB without raising.
+        img = Image.new("RGB", (80, 60), (10, 20, 30))
+        result = app.load_image(image_to_data_url(img))
+        self.assertEqual(result.mode, "RGB")
+        self.assertEqual(result.size, (80, 60))
+
+
 class MultiScreenDetectionTests(unittest.TestCase):
     def test_two_screens_returns_two_candidates(self) -> None:
         payload = {"image": image_to_data_url(make_two_screen_image())}

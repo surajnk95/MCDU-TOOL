@@ -929,6 +929,64 @@ def run_tesseract_boxes(image: Image.Image) -> list[dict[str, Any]]:
         return max(candidates, key=box_score)
 
 
+def _ocr_confidence_score(image: Image.Image) -> float:
+    """Single-PSM Tesseract pass; return sum of (confidence × character-count).
+
+    Used only for orientation probing — one call per rotation candidate, so the
+    function intentionally avoids the multi-PSM loop in run_tesseract_tsv.
+    """
+    try:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            source = Path(temp_dir) / "probe.png"
+            image.save(source)
+            command = [
+                TESSERACT, str(source), "stdout",
+                "--psm", "11", "-l", "eng",
+                "-c", f"tessedit_char_whitelist={OCR_WHITELIST}",
+                "tsv",
+            ]
+            completed = subprocess.run(
+                command, capture_output=True, text=True, check=False, timeout=12
+            )
+            if completed.returncode != 0:
+                return 0.0
+            total = 0.0
+            for row in csv.DictReader(io.StringIO(completed.stdout), delimiter="\t"):
+                text = (row.get("text") or "").strip()
+                try:
+                    conf = float(row.get("conf") or -1)
+                except ValueError:
+                    conf = -1
+                if text and conf >= 15:
+                    total += conf * len(text)
+            return total
+    except Exception:  # noqa: BLE001 - probe must never raise
+        return 0.0
+
+
+def probe_orientation(image: Image.Image) -> int:
+    """Try 0 / 90 / 180 / 270° rotations; return the angle with the highest OCR score.
+
+    Runs four single-PSM Tesseract passes on a 300 px downscale, so it completes
+    in roughly 1–2 s.  Returns 0 when all four scores are equal (safe no-op).
+    Callers should apply PIL Image.rotate(result, expand=True) to correct the image.
+    """
+    scale = min(1.0, 300.0 / max(image.size))
+    small = image.resize(
+        (max(1, round(image.width * scale)), max(1, round(image.height * scale))),
+        Image.Resampling.BILINEAR,
+    )
+    best_angle = 0
+    best_score = -1.0
+    for angle in (0, 90, 180, 270):
+        candidate = small.rotate(angle, expand=True) if angle else small
+        score = _ocr_confidence_score(preprocess_for_ocr(candidate))
+        if score > best_score:
+            best_score = score
+            best_angle = angle
+    return best_angle
+
+
 def clean_ocr_text(text: str) -> str:
     text = text.replace("|", "I")
     text = text.replace("º", "°").replace("˚", "°").replace("Â°", "°")
@@ -1623,6 +1681,18 @@ def component_corners(component: dict[str, Any], scale: float) -> list[dict[str,
 
 def detect_display(payload: dict[str, Any]) -> dict[str, Any]:
     image = load_image(str(payload["image"]))
+
+    # Orientation probe: run before detection so detection sees the corrected image.
+    # Skipped when the caller already rotated the image manually (skipOrientationProbe).
+    rotation = 0
+    if not bool(payload.get("skipOrientationProbe", False)):
+        try:
+            rotation = probe_orientation(image)
+        except Exception:  # noqa: BLE001 - probe failure must not block detection
+            rotation = 0
+        if rotation != 0:
+            image = image.rotate(rotation, expand=True)
+
     scale = min(1.0, 900 / max(image.size))
     small = image.resize((max(1, round(image.width * scale)), max(1, round(image.height * scale))))
     arr = np.asarray(small).astype(np.float32)
@@ -1708,6 +1778,7 @@ def detect_display(payload: dict[str, Any]) -> dict[str, Any]:
         "displaySize": {"width": round(display_width), "height": round(display_height)},
         "candidates": candidates,
         "bestIndex": 0,
+        "rotation": rotation,
     }
 
 
