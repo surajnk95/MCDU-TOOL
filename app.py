@@ -36,6 +36,19 @@ EXPORTS = DATA / "exports"
 CORRECTIONS = DATA / "corrections.json"
 TEMPLATES = DATA / "templates.json"
 BLANK_TEMPLATE_KEY = "__BLANK__"
+VOCAB_WORDS = DATA / "mcdu_user_words.txt"
+VOCAB_PATTERNS = DATA / "mcdu_user_patterns.txt"
+# Tesseract user-patterns syntax: \n matches a digit, other characters are
+# literal. (NOT regex — \d / \. are rejected as "Invalid user pattern".)
+MCDU_TESSERACT_PATTERNS = [
+    r"FL\n\n",
+    r"FL\n\n\n",
+    r".\n\n\n",
+    r"\n\n\n\n",
+    r"\n\n\n\n\n",
+    r"\n\n/\n\n",
+    r"\n\n\n/\n\n\n",
+]
 
 ROWS = 13
 COLS = 40
@@ -163,6 +176,8 @@ def ensure_dirs() -> None:
         CORRECTIONS.write_text("{}", encoding="utf-8")
     if not TEMPLATES.exists():
         TEMPLATES.write_text("{}", encoding="utf-8")
+    VOCAB_WORDS.write_text("\n".join(sorted(MCDU_VOCABULARY)), encoding="utf-8")
+    VOCAB_PATTERNS.write_text("\n".join(MCDU_TESSERACT_PATTERNS), encoding="utf-8")
     cleanup_exports()
 
 
@@ -675,6 +690,13 @@ def ocr_message_boxes(warped: Image.Image, geometry: dict) -> list[dict]:
 
 
 def cell_feature(image: Image.Image, row: int, col: int) -> list[float]:
+    """Extract a centered, normalized glyph patch for the given grid cell (#21).
+
+    The glyph's tight bounding box is detected, translated to the centre of the
+    16×24 canvas, then the patch is zero-mean / unit-variance normalized so that
+    cosine similarity (feature_distance) is scale-invariant.  Falls back to a
+    simpler mean-subtraction when OpenCV is absent or the cell is blank.
+    """
     screen_w, screen_h = image.size
     cell_w = screen_w / COLS
     cell_h = screen_h / ROWS
@@ -688,17 +710,53 @@ def cell_feature(image: Image.Image, row: int, col: int) -> list[float]:
     )
     crop = max_channel_gray(image.crop(box)).resize((16, 24), Image.Resampling.BILINEAR)
     arr = np.asarray(crop).astype(np.float32)
-    threshold = max(90.0, float(arr.mean() + arr.std() * 0.65))
-    mask = (arr > threshold).astype(np.float32)
-    return mask.reshape(-1).tolist()
+
+    try:
+        import cv2  # noqa: F401
+        threshold_val = max(90.0, float(arr.mean() + arr.std() * 0.65))
+        mask = arr > threshold_val
+        if mask.any():
+            row_idx, col_idx = np.nonzero(mask)
+            r0, r1 = int(row_idx.min()), int(row_idx.max())
+            c0, c1 = int(col_idx.min()), int(col_idx.max())
+            glyph_h = r1 - r0 + 1
+            glyph_w = c1 - c0 + 1
+            centered = np.zeros((24, 16), dtype=np.float32)
+            dr = max(0, (24 - glyph_h) // 2)
+            dc = max(0, (16 - glyph_w) // 2)
+            src_h = min(glyph_h, 24 - dr)
+            src_w = min(glyph_w, 16 - dc)
+            centered[dr : dr + src_h, dc : dc + src_w] = arr[r0 : r0 + src_h, c0 : c0 + src_w]
+            arr = centered
+    except ImportError:
+        pass
+
+    mean = float(arr.mean())
+    std = float(arr.std())
+    if std > 1e-6:
+        arr = (arr - mean) / std
+    else:
+        arr = arr - mean
+    return arr.reshape(-1).tolist()
 
 
 def feature_distance(a: list[float], b: list[float]) -> float:
+    """Cosine-similarity distance ∈ [0, 1]: 0 = identical, 1 = anti-correlated (#21).
+
+    Uses NCC (normalized cross-correlation) so the metric is scale-invariant and
+    works correctly regardless of whether the stored template was captured from a
+    bright or a dim cell.
+    """
     if len(a) != len(b):
         return 1.0
     arr_a = np.asarray(a, dtype=np.float32)
     arr_b = np.asarray(b, dtype=np.float32)
-    return float(np.mean(np.abs(arr_a - arr_b)))
+    dot_aa = float(np.dot(arr_a, arr_a))
+    dot_bb = float(np.dot(arr_b, arr_b))
+    if dot_aa < 1e-12 or dot_bb < 1e-12:
+        return 0.0 if dot_aa < 1e-12 and dot_bb < 1e-12 else 1.0
+    ncc = float(np.dot(arr_a, arr_b)) / math.sqrt(dot_aa * dot_bb)
+    return (1.0 - max(-1.0, min(1.0, ncc))) / 2.0
 
 
 def load_templates() -> dict[str, list[list[float]]]:
@@ -733,7 +791,7 @@ def classify_from_templates(feature: list[float], templates: dict[str, list[list
             if distance < best_distance:
                 best_char = char
                 best_distance = distance
-    if best_char and best_distance <= 0.16:
+    if best_char and best_distance <= 0.25:
         return best_char, best_distance
     return None
 
@@ -1042,6 +1100,22 @@ def run_paddle_ocr(image: Image.Image) -> tuple[list[dict[str, Any]], str]:
     return sorted(words, key=lambda item: (int(item["top"]), int(item["left"]))), ""
 
 
+def _tesseract_extra_args() -> list[str]:
+    """Shared Tesseract flags added to every OCR call (#19/#20).
+
+    --oem 1  forces the LSTM engine.
+    user_defined_dpi=300  silences DPI warnings and anchors font-size heuristics.
+    --user-words / --user-patterns  hint the recognizer toward MCDU vocabulary;
+    only included when the files actually exist (written by ensure_dirs).
+    """
+    args = ["--oem", "1", "-c", "user_defined_dpi=300"]
+    if VOCAB_WORDS.exists():
+        args.extend(["--user-words", str(VOCAB_WORDS)])
+    if VOCAB_PATTERNS.exists():
+        args.extend(["--user-patterns", str(VOCAB_PATTERNS)])
+    return args
+
+
 def run_tesseract_tsv(image: Image.Image) -> list[dict[str, Any]]:
     ensure_dirs()
     with tempfile.TemporaryDirectory() as temp_dir:
@@ -1061,6 +1135,7 @@ def run_tesseract_tsv(image: Image.Image) -> list[dict[str, Any]]:
                 "eng",
                 "-c",
                 f"tessedit_char_whitelist={OCR_WHITELIST}",
+                *_tesseract_extra_args(),
                 "tsv",
             ]
             try:
@@ -1122,12 +1197,11 @@ def run_tesseract_boxes(image: Image.Image) -> list[dict[str, Any]]:
                 "stdout",
                 "--psm",
                 psm,
-                "--oem",
-                "1",
                 "-l",
                 "eng",
                 "-c",
                 f"tessedit_char_whitelist={OCR_WHITELIST}",
+                *_tesseract_extra_args(),
                 "makebox",
             ]
             try:
@@ -1202,6 +1276,7 @@ def _run_tesseract_single_line(image: Image.Image) -> list[dict[str, Any]]:
             "eng",
             "-c",
             f"tessedit_char_whitelist={OCR_WHITELIST}",
+            *_tesseract_extra_args(),
             "tsv",
         ]
         try:
@@ -1328,10 +1403,14 @@ def _ocr_confidence_score(image: Image.Image) -> float:
         with tempfile.TemporaryDirectory() as temp_dir:
             source = Path(temp_dir) / "probe.png"
             image.save(source)
+            # No char whitelist here: on some Tesseract builds the whitelist
+            # forces reported confidence to 0, which would make this probe a
+            # no-op. The probe only needs a relative confidence signal, not
+            # clean text, so the whitelist is intentionally omitted.
             command = [
                 TESSERACT, str(source), "stdout",
                 "--psm", "11", "-l", "eng",
-                "-c", f"tessedit_char_whitelist={OCR_WHITELIST}",
+                *_tesseract_extra_args(),
                 "tsv",
             ]
             completed = subprocess.run(

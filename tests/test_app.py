@@ -456,8 +456,9 @@ class PreprocessingTests(unittest.TestCase):
 
         feature = app.cell_feature(img, row=6, col=20)
         self.assertEqual(len(feature), 16 * 24)
-        # max-channel makes magenta bright (220 > 90 threshold) → non-zero mask entries
-        self.assertGreater(sum(feature), 0)
+        # After centering + zero-mean normalization the bright pixels are positive.
+        # sum ≈ 0 (zero mean), but max > 0 confirms the glyph was detected.
+        self.assertGreater(max(feature), 0)
 
 
 def image_to_data_url(image: Image.Image) -> str:
@@ -823,6 +824,120 @@ class PerRowStripOcrTests(unittest.TestCase):
         except Exception as exc:  # noqa: BLE001
             self.fail(f"per_row_strip_ocr raised unexpectedly: {exc}")
         self.assertEqual(len(grid), app.ROWS)
+
+
+class TesseractConfigTests(unittest.TestCase):
+    """Tests for shared Tesseract flags added by _tesseract_extra_args (#19/#20)."""
+
+    def test_extra_args_contains_oem1(self) -> None:
+        args = app._tesseract_extra_args()
+        oem_idx = next((i for i, v in enumerate(args) if v == "--oem"), None)
+        self.assertIsNotNone(oem_idx, "--oem missing from _tesseract_extra_args")
+        self.assertEqual(args[oem_idx + 1], "1")  # type: ignore[index]
+
+    def test_extra_args_contains_dpi300(self) -> None:
+        args = app._tesseract_extra_args()
+        self.assertTrue(
+            any("user_defined_dpi=300" in arg for arg in args),
+            "user_defined_dpi=300 missing from _tesseract_extra_args",
+        )
+
+    def test_vocab_words_file_written_by_ensure_dirs(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with (
+                patch.object(app, "DATA", Path(temp_dir)),
+                patch.object(app, "EXPORTS", Path(temp_dir) / "exports"),
+                patch.object(app, "CORRECTIONS", Path(temp_dir) / "corrections.json"),
+                patch.object(app, "TEMPLATES", Path(temp_dir) / "templates.json"),
+                patch.object(app, "VOCAB_WORDS", Path(temp_dir) / "mcdu_user_words.txt"),
+                patch.object(app, "VOCAB_PATTERNS", Path(temp_dir) / "mcdu_user_patterns.txt"),
+                patch.object(app, "cleanup_exports"),
+            ):
+                app.ensure_dirs()
+                words_file = Path(temp_dir) / "mcdu_user_words.txt"
+                patterns_file = Path(temp_dir) / "mcdu_user_patterns.txt"
+                self.assertTrue(words_file.exists(), "mcdu_user_words.txt not created")
+                self.assertTrue(patterns_file.exists(), "mcdu_user_patterns.txt not created")
+                words = words_file.read_text(encoding="utf-8").splitlines()
+                self.assertIn("LEGS", words)
+                self.assertIn("CRZ", words)
+                patterns = patterns_file.read_text(encoding="utf-8").splitlines()
+                # Tesseract user-pattern syntax: \n is a digit (regex \d is rejected).
+                self.assertTrue(any(r"FL\n\n" in p for p in patterns))
+                self.assertFalse(
+                    any(r"\d" in p for p in patterns),
+                    "patterns must not use regex \\d — Tesseract rejects it",
+                )
+
+
+class TemplateMatcherTests(unittest.TestCase):
+    """Tests for the upgraded NCC template matcher (#21)."""
+
+    def test_feature_distance_identical_is_zero(self) -> None:
+        a = [1.5, -0.7, 0.3, 0.0]
+        self.assertAlmostEqual(app.feature_distance(a, a), 0.0, places=5)
+
+    def test_feature_distance_mismatched_lengths_is_one(self) -> None:
+        self.assertEqual(app.feature_distance([1.0], [1.0, 2.0]), 1.0)
+
+    def test_feature_distance_orthogonal_is_half(self) -> None:
+        # Orthogonal vectors → cosine = 0 → distance = 0.5
+        self.assertAlmostEqual(app.feature_distance([1.0, 0.0], [0.0, 1.0]), 0.5, places=5)
+
+    def test_feature_distance_opposite_is_one(self) -> None:
+        # Anti-correlated vectors → cosine = -1 → distance = 1.0
+        self.assertAlmostEqual(app.feature_distance([1.0], [-1.0]), 1.0, places=5)
+
+    def test_feature_distance_both_zero_is_zero(self) -> None:
+        # Two blank features (all zeros) match each other — both are "empty cells"
+        self.assertAlmostEqual(app.feature_distance([0.0, 0.0], [0.0, 0.0]), 0.0, places=5)
+
+    def test_cell_feature_length_is_384(self) -> None:
+        img = Image.new("RGB", (1600, 1300), (10, 10, 10))
+        feature = app.cell_feature(img, row=0, col=1)
+        self.assertEqual(len(feature), 16 * 24)
+
+    def test_cell_feature_bright_cell_has_positive_max(self) -> None:
+        # Bright content in a cell → after centering + normalization, max > 0
+        img = Image.new("RGB", (1600, 1300), (10, 10, 10))
+        draw = ImageDraw.Draw(img)
+        cell_w = 1600 / app.COLS
+        cell_h = 1300 / app.ROWS
+        cx1 = int(20 * cell_w) + 5
+        cy1 = int(6 * cell_h) + 5
+        cx2 = int(21 * cell_w) - 5
+        cy2 = int(7 * cell_h) - 5
+        draw.rectangle((cx1, cy1, cx2, cy2), fill=(220, 220, 220))
+        feature = app.cell_feature(img, row=6, col=20)
+        self.assertGreater(max(feature), 0.0)
+
+    def test_cell_feature_same_char_closer_than_different(self) -> None:
+        # Two versions of the same glyph should be closer to each other
+        # than to a clearly different cell.
+        img_a = Image.new("RGB", (1600, 1300), (5, 5, 5))
+        img_b = Image.new("RGB", (1600, 1300), (5, 5, 5))
+        img_c = Image.new("RGB", (1600, 1300), (5, 5, 5))
+        draw_a = ImageDraw.Draw(img_a)
+        draw_b = ImageDraw.Draw(img_b)
+        draw_c = ImageDraw.Draw(img_c)
+        cell_w = 1600 / app.COLS
+        cell_h = 1300 / app.ROWS
+        row, col = 4, 10
+        x0 = int(col * cell_w) + 4
+        y0 = int(row * cell_h) + 4
+        x1 = int((col + 1) * cell_w) - 4
+        y1 = int((row + 1) * cell_h) - 4
+        # img_a and img_b: near-identical small white rectangle (same character proxy)
+        draw_a.rectangle((x0, y0, x1, y1), fill=(210, 210, 210))
+        draw_b.rectangle((x0 + 1, y0 + 1, x1, y1), fill=(215, 215, 215))
+        # img_c: completely different — large rectangle filling the whole cell
+        draw_c.rectangle((x0 - 4, y0 - 4, x1 + 4, y1 + 4), fill=(5, 5, 5))  # blank (no glyph)
+        feat_a = app.cell_feature(img_a, row, col)
+        feat_b = app.cell_feature(img_b, row, col)
+        feat_c = app.cell_feature(img_c, row, col)
+        dist_same = app.feature_distance(feat_a, feat_b)
+        dist_diff = app.feature_distance(feat_a, feat_c)
+        self.assertLess(dist_same, dist_diff, "Similar glyphs should be closer than dissimilar ones")
 
 
 if __name__ == "__main__":
