@@ -354,8 +354,20 @@ def warp_screen(image: Image.Image, corners: list[dict[str, float]]) -> Image.Im
     return warped
 
 
+def max_channel_gray(image: Image.Image) -> Image.Image:
+    """Return max(R, G, B) per pixel as an L-mode image (HSV Value channel).
+
+    All MCDU text colors (white, magenta, cyan, amber, green) are bright in at
+    least one channel; the dark background is uniformly low.  Using the maximum
+    channel preserves every color while keeping the background dark — superior to
+    a plain luminance average, which attenuates magenta and amber significantly.
+    """
+    arr = np.asarray(image.convert("RGB"), dtype=np.uint8)
+    return Image.fromarray(np.max(arr, axis=2), mode="L")
+
+
 def preprocess_for_ocr(image: Image.Image) -> Image.Image:
-    gray = ImageOps.grayscale(image)
+    gray = max_channel_gray(image)
     gray = ImageOps.invert(gray)
     gray = ImageEnhance.Contrast(gray).enhance(2.8)
     gray = gray.filter(ImageFilter.SHARPEN)
@@ -363,12 +375,49 @@ def preprocess_for_ocr(image: Image.Image) -> Image.Image:
 
 
 def preprocessing_variants(image: Image.Image) -> list[tuple[str, Image.Image]]:
-    gray = ImageOps.grayscale(image)
-    return [
+    gray = max_channel_gray(image)
+    variants: list[tuple[str, Image.Image]] = [
         ("contrast", preprocess_for_ocr(image)),
         ("inverted", ImageOps.invert(gray)),
         ("grayscale", ImageOps.autocontrast(gray, cutoff=1)),
     ]
+
+    try:
+        import cv2  # optional; already in requirements.txt as opencv-python-headless
+
+        gray_arr = np.asarray(gray, dtype=np.uint8)
+
+        # #11 — 2× upscale so Tesseract sees ~30–40 px cap height
+        rgb_arr = np.asarray(image.convert("RGB"), dtype=np.uint8)
+        h, w = rgb_arr.shape[:2]
+        up_arr = cv2.resize(rgb_arr, (w * 2, h * 2), interpolation=cv2.INTER_CUBIC)
+        variants.append(("upscale2x", preprocess_for_ocr(Image.fromarray(up_arr, mode="RGB"))))
+
+        # #12 — Denoise (fast NL-means removes phone sensor grain)
+        denoised = cv2.fastNlMeansDenoising(gray_arr, None, h=10, templateWindowSize=7, searchWindowSize=21)
+        variants.append(("denoised", ImageOps.invert(Image.fromarray(denoised, mode="L"))))
+
+        # #12 — Unsharp mask (counters soft blur from defocus / compression)
+        blurred = cv2.GaussianBlur(gray_arr, (0, 0), 2.0)
+        sharpened = np.clip(cv2.addWeighted(gray_arr, 1.5, blurred, -0.5, 0), 0, 255).astype(np.uint8)
+        variants.append(("unsharp", ImageOps.invert(Image.fromarray(sharpened, mode="L"))))
+
+        # #13 — Otsu binarization (global threshold; works well on bimodal MCDU histograms)
+        _, otsu = cv2.threshold(gray_arr, 0, 255, cv2.THRESH_BINARY_INV | cv2.THRESH_OTSU)
+        variants.append(("otsu", Image.fromarray(otsu, mode="L")))
+
+        # #13 — Adaptive threshold (Gaussian neighbourhood; handles uneven glare)
+        adapted = cv2.adaptiveThreshold(
+            gray_arr, 255,
+            cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV,
+            blockSize=21, C=10,
+        )
+        variants.append(("adaptive", Image.fromarray(adapted, mode="L")))
+
+    except ImportError:
+        pass  # OpenCV absent — the three pure-PIL variants above are still returned
+
+    return variants
 
 
 def cell_feature(image: Image.Image, row: int, col: int) -> list[float]:
@@ -383,7 +432,7 @@ def cell_feature(image: Image.Image, row: int, col: int) -> list[float]:
         int(min(screen_w, (col + 1) * cell_w + pad_x)),
         int(min(screen_h, (row + 1) * cell_h + pad_y)),
     )
-    crop = ImageOps.grayscale(image.crop(box)).resize((16, 24), Image.Resampling.BILINEAR)
+    crop = max_channel_gray(image.crop(box)).resize((16, 24), Image.Resampling.BILINEAR)
     arr = np.asarray(crop).astype(np.float32)
     threshold = max(90.0, float(arr.mean() + arr.std() * 0.65))
     mask = (arr > threshold).astype(np.float32)

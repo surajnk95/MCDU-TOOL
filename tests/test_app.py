@@ -6,7 +6,7 @@ from unittest.mock import patch
 
 import app
 import numpy as np
-from PIL import ImageDraw
+from PIL import Image, ImageDraw, ImageOps
 
 
 def grid_with_row(text: str, row: int = 0) -> list[list[str]]:
@@ -342,6 +342,120 @@ class BlankCorrectionTests(unittest.TestCase):
         saved = save.call_args.args[0]
         self.assertEqual(len(saved), 1)
         self.assertFalse(next(iter(saved.values())).strip())
+
+
+class PreprocessingTests(unittest.TestCase):
+    def _make_mcdu_image(self) -> Image.Image:
+        """80×60 RGB image: dark background with white, magenta, and cyan text pixels."""
+        img = Image.new("RGB", (80, 60), (10, 10, 10))
+        draw = ImageDraw.Draw(img)
+        draw.rectangle((5, 5, 15, 15), fill=(230, 230, 230))   # white text
+        draw.rectangle((20, 5, 30, 15), fill=(220, 0, 220))     # magenta text
+        draw.rectangle((35, 5, 45, 15), fill=(0, 210, 210))     # cyan text
+        return img
+
+    def test_max_channel_gray_is_brighter_than_luminance_for_magenta(self) -> None:
+        # A pure magenta pixel (255, 0, 255) has luminance ≈ 73 but max-channel = 255.
+        img = Image.new("RGB", (4, 4), (255, 0, 255))
+        mc = app.max_channel_gray(img)
+        lum = ImageOps.grayscale(img)
+        mc_val = np.asarray(mc).mean()
+        lum_val = np.asarray(lum).mean()
+        self.assertGreater(mc_val, lum_val + 50)
+
+    def test_max_channel_gray_is_brighter_than_luminance_for_amber(self) -> None:
+        # Amber (255, 191, 0) has luminance ≈ 178 but max-channel = 255.
+        img = Image.new("RGB", (4, 4), (255, 191, 0))
+        mc = app.max_channel_gray(img)
+        lum = ImageOps.grayscale(img)
+        mc_val = np.asarray(mc).mean()
+        lum_val = np.asarray(lum).mean()
+        self.assertGreater(mc_val, lum_val + 50)
+
+    def test_max_channel_gray_keeps_dark_background_dark(self) -> None:
+        img = Image.new("RGB", (4, 4), (8, 8, 8))
+        mc = app.max_channel_gray(img)
+        self.assertLessEqual(np.asarray(mc).mean(), 10)
+
+    def test_preprocessing_variants_returns_at_least_three(self) -> None:
+        img = self._make_mcdu_image()
+        variants = app.preprocessing_variants(img)
+        self.assertGreaterEqual(len(variants), 3)
+        names = [name for name, _ in variants]
+        self.assertIn("contrast", names)
+        self.assertIn("inverted", names)
+        self.assertIn("grayscale", names)
+
+    def test_preprocessing_variants_returns_pil_images(self) -> None:
+        img = self._make_mcdu_image()
+        for name, variant in app.preprocessing_variants(img):
+            self.assertIsInstance(variant, Image.Image), f"{name!r} variant is not a PIL Image"
+
+    def test_cv2_variants_present_when_opencv_available(self) -> None:
+        try:
+            import cv2  # noqa: F401
+        except ImportError:
+            self.skipTest("OpenCV not installed")
+        img = self._make_mcdu_image()
+        names = [name for name, _ in app.preprocessing_variants(img)]
+        self.assertIn("upscale2x", names)
+        self.assertIn("denoised", names)
+        self.assertIn("unsharp", names)
+        self.assertIn("otsu", names)
+        self.assertIn("adaptive", names)
+
+    def test_upscale2x_variant_is_twice_the_input_size(self) -> None:
+        try:
+            import cv2  # noqa: F401
+        except ImportError:
+            self.skipTest("OpenCV not installed")
+        img = self._make_mcdu_image()  # 80×60
+        variants = dict(app.preprocessing_variants(img))
+        upscaled = variants["upscale2x"]
+        self.assertEqual(upscaled.size, (160, 120))
+
+    def test_otsu_variant_is_binary(self) -> None:
+        try:
+            import cv2  # noqa: F401
+        except ImportError:
+            self.skipTest("OpenCV not installed")
+        img = self._make_mcdu_image()
+        variants = dict(app.preprocessing_variants(img))
+        otsu_arr = np.asarray(variants["otsu"])
+        unique_vals = set(otsu_arr.flatten().tolist())
+        self.assertTrue(unique_vals.issubset({0, 255}), f"Otsu output has non-binary values: {unique_vals}")
+
+    def test_adaptive_variant_is_binary(self) -> None:
+        try:
+            import cv2  # noqa: F401
+        except ImportError:
+            self.skipTest("OpenCV not installed")
+        img = self._make_mcdu_image()
+        variants = dict(app.preprocessing_variants(img))
+        adaptive_arr = np.asarray(variants["adaptive"])
+        unique_vals = set(adaptive_arr.flatten().tolist())
+        self.assertTrue(unique_vals.issubset({0, 255}), f"Adaptive output has non-binary values: {unique_vals}")
+
+    def test_cell_feature_uses_max_channel(self) -> None:
+        # Image: dark background with a magenta rectangle inside cell (6, 20).
+        # Magenta (220, 0, 220) has max-channel=220 but luminance≈73.
+        # The threshold is max(90, mean+std*0.65); with a dark background the mean is
+        # very low, so threshold lands at the 90 floor.  max-channel pixels at 220
+        # clear it; luminance pixels at 73 do not.
+        img = Image.new("RGB", (1600, 1300), (5, 5, 5))
+        draw = ImageDraw.Draw(img)
+        cell_w = 1600 / app.COLS
+        cell_h = 1300 / app.ROWS
+        cx1 = int(20 * cell_w) + 5
+        cy1 = int(6 * cell_h) + 5
+        cx2 = int(21 * cell_w) - 5
+        cy2 = int(7 * cell_h) - 5
+        draw.rectangle((cx1, cy1, cx2, cy2), fill=(220, 0, 220))
+
+        feature = app.cell_feature(img, row=6, col=20)
+        self.assertEqual(len(feature), 16 * 24)
+        # max-channel makes magenta bright (220 > 90 threshold) → non-zero mask entries
+        self.assertGreater(sum(feature), 0)
 
 
 if __name__ == "__main__":
