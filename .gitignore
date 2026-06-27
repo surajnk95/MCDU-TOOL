@@ -1,8 +1,15 @@
 __pycache__/
 *.pyc
+.pytest_cache/
+.DS_Store
+
+# Runtime data (regenerated at startup / learned locally)
 data/corrections.json
 data/templates.json
+data/mcdu_user_words.txt
+data/mcdu_user_patterns.txt
 data/exports/*
 !data/exports/.gitkeep
-single_python_version/corrections.json
-single_python_version/templates.json
+
+# Local reference photos used for manual testing
+test_photos/
