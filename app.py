@@ -1434,25 +1434,37 @@ def _ocr_confidence_score(image: Image.Image) -> float:
 
 
 def probe_orientation(image: Image.Image) -> int:
-    """Try 0 / 90 / 180 / 270° rotations; return the angle with the highest OCR score.
+    """Return 0, 90 or 270 — the upright correction for a sideways phone photo.
 
-    Runs four single-PSM Tesseract passes on a 300 px downscale, so it completes
-    in roughly 1–2 s.  Returns 0 when all four scores are equal (safe no-op).
-    Callers should apply PIL Image.rotate(result, expand=True) to correct the image.
+    Scores 0/90/180/270° by OCR confidence on a 300 px downscale, but only ever
+    auto-applies a 90 or 270 rotation, and only when the winning sideways angle
+    clearly beats upright.  A 180° flip is excluded entirely: phones are not held
+    upside down, and 180 is a common false positive that would destroy an upright
+    image (use the manual rotate button for the rare real case).  Returns 0 when
+    in doubt.  Callers apply PIL Image.rotate(result, expand=True).
     """
-    scale = min(1.0, 300.0 / max(image.size))
+    # Downscale to ~1000 px with LANCZOS. A more aggressive downscale (or a
+    # BILINEAR filter) aliases the thin MCDU text into orientation-dependent
+    # noise and makes the probe pick a wrong rotation on a sharp upright photo.
+    scale = min(1.0, 1000.0 / max(image.size))
     small = image.resize(
         (max(1, round(image.width * scale)), max(1, round(image.height * scale))),
-        Image.Resampling.BILINEAR,
+        Image.Resampling.LANCZOS,
     )
-    best_angle = 0
-    best_score = -1.0
+    scores: dict[int, float] = {}
     for angle in (0, 90, 180, 270):
         candidate = small.rotate(angle, expand=True) if angle else small
-        score = _ocr_confidence_score(preprocess_for_ocr(candidate))
-        if score > best_score:
-            best_score = score
-            best_angle = angle
+        scores[angle] = _ocr_confidence_score(preprocess_for_ocr(candidate))
+
+    upright = scores[0]
+    best_angle = 90 if scores[90] >= scores[270] else 270
+    best = scores[best_angle]
+    if best <= 0:
+        return 0
+    # A genuinely sideways photo reads almost nothing upright, so the winning
+    # rotation dominates. Require a clear margin before disturbing the image.
+    if upright > 0 and best < upright * 1.6:
+        return 0
     return best_angle
 
 
