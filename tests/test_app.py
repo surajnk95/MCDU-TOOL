@@ -766,5 +766,64 @@ class CleanWarpedTests(unittest.TestCase):
         self.assertGreater(float(bg_region.mean()), 100, "Blue bg should become light")
 
 
+class PerRowStripOcrTests(unittest.TestCase):
+    """Tests for per_row_strip_ocr (#18) — per-row Tesseract --psm 7 pass."""
+
+    def _make_mcdu_warped(self, width: int = 1600, height: int = 1040) -> Image.Image:
+        return Image.new("RGB", (width, height), (0, 0, 0))
+
+    def test_per_row_strip_ocr_returns_correct_grid_dimensions(self) -> None:
+        warped = self._make_mcdu_warped()
+        geometry = app.calibrate_grid([], warped.size)
+        grid, conf = app.per_row_strip_ocr(warped, geometry)
+        self.assertEqual(len(grid), app.ROWS)
+        self.assertEqual(len(conf), app.ROWS)
+        for row in range(app.ROWS):
+            self.assertEqual(len(grid[row]), app.COLS)
+            self.assertEqual(len(conf[row]), app.COLS)
+
+    def test_per_row_strip_ocr_only_writes_to_data_columns(self) -> None:
+        # Guard cells (0 and 39) must never be written, regardless of OCR output
+        warped = self._make_mcdu_warped()
+        geometry = app.calibrate_grid([], warped.size)
+        grid, _ = app.per_row_strip_ocr(warped, geometry)
+        for row in range(app.ROWS):
+            self.assertEqual(grid[row][0], "", f"Row {row} col 0 guard was written")
+            self.assertEqual(grid[row][app.COLS - 1], "", f"Row {row} col 39 guard was written")
+        # All characters written must be from the OCR whitelist
+        for row in range(app.ROWS):
+            for col in range(app.FIRST_DATA_COL, app.LAST_DATA_COL + 1):
+                char = grid[row][col]
+                if char:
+                    self.assertIn(char, app.OCR_WHITELIST, f"Cell [{row}][{col}] = {char!r} not in whitelist")
+
+    def test_per_row_strip_ocr_guard_cells_remain_empty(self) -> None:
+        warped = self._make_mcdu_warped()
+        geometry = app.calibrate_grid([], warped.size)
+        grid, _ = app.per_row_strip_ocr(warped, geometry)
+        for row in range(app.ROWS):
+            self.assertEqual(grid[row][0], "", "Column 0 guard must remain empty")
+            self.assertEqual(grid[row][app.COLS - 1], "", "Column 39 guard must remain empty")
+
+    def test_per_row_strip_ocr_does_not_hallucinate_on_blank_image(self) -> None:
+        # A blank (all-black) display has no ink, so the ink gate must skip every
+        # strip — no characters may be written, otherwise PSM 7 would inject junk
+        # into empty rows that row_candidate_score could pick over a blank row.
+        warped = self._make_mcdu_warped()
+        geometry = app.calibrate_grid([], warped.size)
+        grid, _ = app.per_row_strip_ocr(warped, geometry)
+        written = sum(bool(cell) for row in grid for cell in row)
+        self.assertEqual(written, 0, "Blank display produced hallucinated characters")
+
+    def test_per_row_strip_ocr_does_not_crash_on_tiny_image(self) -> None:
+        warped = self._make_mcdu_warped(width=80, height=52)
+        geometry = app.calibrate_grid([], warped.size)
+        try:
+            grid, conf = app.per_row_strip_ocr(warped, geometry)
+        except Exception as exc:  # noqa: BLE001
+            self.fail(f"per_row_strip_ocr raised unexpectedly: {exc}")
+        self.assertEqual(len(grid), app.ROWS)
+
+
 if __name__ == "__main__":
     unittest.main()

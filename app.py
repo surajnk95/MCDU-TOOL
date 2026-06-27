@@ -1183,6 +1183,141 @@ def run_tesseract_boxes(image: Image.Image) -> list[dict[str, Any]]:
         return max(candidates, key=box_score)
 
 
+def _run_tesseract_single_line(image: Image.Image) -> list[dict[str, Any]]:
+    """Run Tesseract --psm 7 (single text line) on a strip image.
+
+    Lighter-weight than run_tesseract_tsv: no multi-PSM scoring, one call.
+    Returns [] silently on any error so callers can treat it as a no-op.
+    """
+    with tempfile.TemporaryDirectory() as temp_dir:
+        source = Path(temp_dir) / "strip.png"
+        image.save(source)
+        command = [
+            TESSERACT,
+            str(source),
+            "stdout",
+            "--psm",
+            "7",
+            "-l",
+            "eng",
+            "-c",
+            f"tessedit_char_whitelist={OCR_WHITELIST}",
+            "tsv",
+        ]
+        try:
+            completed = subprocess.run(command, capture_output=True, text=True, check=False, timeout=20)
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            return []
+        if completed.returncode != 0:
+            return []
+        words: list[dict[str, Any]] = []
+        for row in csv.DictReader(io.StringIO(completed.stdout), delimiter="\t"):
+            text = clean_ocr_text((row.get("text") or "").strip())
+            if not text:
+                continue
+            try:
+                conf = float(row.get("conf") or -1)
+            except ValueError:
+                conf = -1
+            if conf < 0:
+                continue
+            words.append(
+                {
+                    "text": text,
+                    "conf": conf,
+                    "left": int(row.get("left") or 0),
+                    "top": int(row.get("top") or 0),
+                    "width": int(row.get("width") or 0),
+                    "height": int(row.get("height") or 0),
+                }
+            )
+        return words
+
+
+def per_row_strip_ocr(
+    warped: Image.Image,
+    geometry: dict,
+) -> tuple[list[list[str]], list[list[float]]]:
+    """Recognise each MCDU row as an isolated strip with Tesseract --psm 7 (#18).
+
+    Slices the warped image into 13 individual data-column strips (cols 1–38),
+    upscales each 3×, preprocesses, and runs Tesseract in single-line mode.
+    Characters are mapped back to their column positions using the known cell
+    width — a layout-independent reading that avoids cross-row confusion and
+    scales better than the whole-image multi-PSM pass on blurry photos.
+
+    The result is added to word_candidates and competes row-by-row with other
+    preprocessing variants via row_candidate_score.
+    """
+    cell_w = geometry["cell_w"]
+    cell_h = geometry["cell_h"]
+    origin_x = geometry["origin_x"]
+    origin_y = geometry["origin_y"]
+    scale = 3
+    data_cols = LAST_DATA_COL - FIRST_DATA_COL + 1
+
+    grid = empty_grid()
+    confidence_out = empty_confidence_grid()
+
+    for row in range(ROWS):
+        y1 = max(0, int(origin_y + row * cell_h))
+        y2 = min(warped.height, int(origin_y + (row + 1) * cell_h))
+        x1 = max(0, int(origin_x + FIRST_DATA_COL * cell_w))
+        x2 = min(warped.width, int(origin_x + (LAST_DATA_COL + 1) * cell_w))
+
+        if x2 <= x1 or y2 <= y1:
+            continue
+
+        strip = warped.crop((x1, y1, x2, y2))
+        # Ink gate: skip strips with almost no bright pixels. PSM 7 assumes the
+        # input IS a line of text and will hallucinate low-confidence characters
+        # on a blank strip, which row_candidate_score could then pick over a
+        # genuinely empty row. A blank strip has near-zero ink, so don't OCR it.
+        ink = np.asarray(max_channel_gray(strip), dtype=np.float32)
+        if ink.size == 0 or float(np.mean(ink > 80)) < 0.004:
+            continue
+        enlarged = strip.resize(
+            (max(1, strip.width * scale), max(1, strip.height * scale)),
+            Image.Resampling.LANCZOS,
+        )
+        processed = preprocess_for_ocr(enlarged)
+        col_w_scaled = enlarged.width / max(1, data_cols)
+
+        try:
+            words = _run_tesseract_single_line(processed)
+        except Exception:  # noqa: BLE001 — supplemental pass; never block the main result
+            continue
+
+        for word in words:
+            text = normalize_mcdu_phrase(str(word.get("text", "")))
+            compact = text.replace(" ", "")
+            if not compact:
+                continue
+            word_left = float(word.get("left", 0))
+            word_width = max(1.0, float(word.get("width", col_w_scaled)))
+            conf = max(0.20, min(0.98, float(word.get("conf", 0)) / 100.0))
+            box_cols = max(1, int(round(word_width / col_w_scaled)))
+            start_col_idx = max(0, int(round(word_left / col_w_scaled)))
+            sequence = text if " " in text and len(text) <= box_cols + 2 else compact
+            use_projected_spacing = " " not in sequence and box_cols > len(compact) + 1
+            max_len = data_cols - start_col_idx
+
+            for index, char in enumerate(sequence[:max_len]):
+                if char.isspace():
+                    continue
+                if use_projected_spacing:
+                    center_x = word_left + word_width * ((index + 0.5) / max(1, len(compact)))
+                    col_idx = min(data_cols - 1, int(center_x / col_w_scaled))
+                else:
+                    col_idx = start_col_idx + index
+                col = clamp_data_col(FIRST_DATA_COL + max(0, min(data_cols - 1, col_idx)))
+                if not grid[row][col]:
+                    grid[row][col] = char
+                    confidence_out[row][col] = conf
+
+    return grid, confidence_out
+
+
 def _ocr_confidence_score(image: Image.Image) -> float:
     """Single-PSM Tesseract pass; return sum of (confidence × character-count).
 
@@ -2710,6 +2845,10 @@ def analyze(payload: dict[str, Any]) -> dict[str, Any]:
         for word in box_words:
             place_word(box_grid, box_scores, box_confidence, word, geometry)
         word_candidates.append(("message_box", box_grid, box_confidence))
+
+    # #18: Per-row strip OCR — Tesseract --psm 7 on each isolated row strip
+    strip_grid, strip_conf = per_row_strip_ocr(warped, geometry)
+    word_candidates.append(("per_row", strip_grid, strip_conf))
 
     hybrid_requested = bool(payload.get("hybridOcr", True))
     paddle_words: list[dict[str, Any]] = []
