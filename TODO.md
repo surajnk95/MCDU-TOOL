@@ -168,3 +168,92 @@ boxes). After each priority lands, re-run these through the tool and confirm:
 
 Keep `python -m pytest tests/test_app.py -v` green, and add tests for new pure functions
 (screen scoring/selection, orientation probe, field validators, cursor/glare masks).
+
+---
+
+# PHASE 2 — Post-photo-testing audit backlog
+
+Findings from running the real pipeline end-to-end on five worst-case phone photos
+(June 2026 audit). Phase 1 above is fully implemented. Same hard constraints apply:
+100% local, no new dependencies, OpenCV-first, PaddleOCR stays optional.
+
+## P2-A. Bugs observed on real photos
+
+**A1. Label duplication eats the value row (critical).** `analyze()` picks the best OCR
+variant PER ROW independently; the same physical word (e.g. "CRZ ALT") can land in row N
+in one variant and row N+1 in another, so it appears twice and the real value row
+(magenta `12000` / `FL204`) is displaced. `mcdu_row_score` rewards the vocabulary label
+on both rows. Fix: (1) after per-row selection, dedupe identical text in adjacent rows —
+keep the row whose source word y-centre is closest to that row's band; (2) in
+`row_candidate_score`, penalize a candidate that duplicates the chosen row above, and
+add a bonus for digit-bearing tokens in the row directly under a label row.
+
+**A2. Column drift splits tokens (e.g. `FL344 FL383 FL344` read as `FL 344 FL38 3FL3 44`).**
+`estimate_grid_origin` corrects phase only, never pitch/scale, and `analyze` passes
+`calibrate_grid([], ...)`. Fix: extend the warp-alignment step (`align_warp_to_grid`) to
+also estimate a small per-axis SCALE from projected ink columns and bake it into the
+warp itself, so backend and browser grid stay consistent.
+
+**A3. Boxed values fuse with their frame (`12000` in an entry box unreadable).** The box
+bottom edge merges with digit bases; the outline eraser skips filled boxes. Fix attempt:
+morphological line removal — binarize, extract long horizontal/vertical strokes with
+`cv2.getStructuringElement` + `MORPH_OPEN`, subtract them, then `MORPH_CLOSE` to re-seal
+digit gaps; apply locally per detected box. Accept that worst-case blur may stay
+unreadable.
+
+**A4. `fuse_grids` tie-break is nondeterministic.** `max(set(votes), key=votes.count)`
+on a 1-1 conflict depends on set order. Make it deterministic (prefer first grid) or
+mark the cell as a conflict; optionally accept confidence grids in `/api/fuse-grids`
+and weight votes.
+
+**A5. Title row misreads (`MOD M.850 D/D` -> `MA Y4.890D/0`).** The inverse-video MOD
+chip (black text on white) breaks polarity. Fix: detect small inverse-video chips and
+OCR them un-inverted (reuse the message-box machinery), and add a page-title fuzzy
+validator — row 0 comes from a small closed vocabulary (ACT/MOD + page names), so
+edit-distance snapping on row 0 is safe.
+
+## P2-B. Accuracy upgrades
+
+**B1. Pre-seeded glyph atlas as a recognition engine (top recommendation).** The font is
+fixed and the grid known. Render the MCDU-style font (B612 Mono is a close open match)
+for the whitelist charset at several blur/thickness levels into a glyph atlas; classify
+each cell by NCC (`cv2.matchTemplate`) against it. `classify_from_templates` exists but
+ships empty. Fuse atlas results as a third engine beside Tesseract/Paddle.
+
+**B2. (Optional, heavy) Fine-tune Tesseract LSTM on the MCDU font** with synthetic
+renders + photo augmentation (tesstrain). Train on the dev machine; office laptop only
+needs the resulting .traineddata file.
+
+**B3. Fuzzy phrase normalization.** `MCDU_PHRASE_REPLACEMENTS` is exact-match, so
+`ENGEOUT>`/`<COSPD`/`LRCSPO` survive. Match with edit distance 1 against the phrase and
+vocabulary lists (difflib already imported).
+
+**B4. Space preservation via char boxes.** Word-level placement compacts spaces
+(`ENG OUT` -> `ENGEOUT`). When char boxes are available for a word, place characters by
+their individual x positions instead of packing from the word's left edge.
+
+## P2-C. Efficiency
+
+**C1. Parallelize Tesseract subprocess calls** in `analyze` (variants x PSMs, box passes,
+row strips) with a ThreadPoolExecutor — currently all serial; expect 3-5x wall-time win.
+
+**C2. Prune the variant x PSM matrix.** Early-exit losing variants after 2 PSMs; add
+per-stage timing logs to learn which variant/PSM combinations actually win.
+
+**C3. Skip redundant passes** (e.g. skip per-row strip OCR when the word grid is already
+high-confidence).
+
+## P2-D. Housekeeping
+
+**D1.** `cleanup_exports` only deletes `.png` — exported `.docx` accumulate forever.
+**D2.** `whole_grid_focused_recheck` output skips `validate_field_formats`.
+**D3.** Blur threshold 80 is loosely calibrated; add a "marginal" band (80-150).
+**D4.** (Optional) split `app.py` (~3,400 lines) into modules.
+
+## P2-E. Testing gap
+
+No end-to-end regression coverage. Build a synthetic MCDU screen renderer in the test
+suite: render a known 13x40 grid in a monospace font on a black screen (optionally
+warp/blur), run the pipeline, assert the grid reads back. Optionally keep 2-3 heavily
+downscaled real photos (~200 KB) as fixtures. This would have caught both the
+orientation bug and A1.
