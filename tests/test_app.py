@@ -1,7 +1,9 @@
 import base64
 import io
 import math
+import os
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -1284,6 +1286,180 @@ class FuseGridsTests(unittest.TestCase):
         g3 = self._make_grid()
         _, summary = app.fuse_grids([g1, g2, g3])
         self.assertEqual(summary["grids"], 3)
+
+
+class FuseGridsDeterminismTests(unittest.TestCase):
+    def _cell_grid(self, row: int, col: int, char: str) -> list[list[str]]:
+        g = app.empty_grid()
+        g[row][col] = char
+        return g
+
+    def test_tie_broken_by_first_grid(self):
+        """On a 1-1 tie the character from grid 0 (first grid) must win."""
+        g1 = self._cell_grid(5, 10, "A")
+        g2 = self._cell_grid(5, 10, "B")
+        fused, summary = app.fuse_grids([g1, g2])
+        self.assertEqual(fused[5][10], "A", "First grid wins on 1-1 tie")
+        self.assertEqual(summary["conflicted"], 1)
+
+    def test_majority_beats_first_grid(self):
+        """A 2-1 majority overrides the first-grid preference."""
+        g1 = self._cell_grid(5, 10, "A")
+        g2 = self._cell_grid(5, 10, "B")
+        g3 = self._cell_grid(5, 10, "B")
+        fused, _ = app.fuse_grids([g1, g2, g3])
+        self.assertEqual(fused[5][10], "B")
+
+    def test_deterministic_on_repeated_calls(self):
+        """Same inputs always produce the same winner (not hash-dependent)."""
+        g1 = self._cell_grid(3, 7, "X")
+        g2 = self._cell_grid(3, 7, "Y")
+        results = {app.fuse_grids([g1, g2])[0][3][7] for _ in range(10)}
+        self.assertEqual(len(results), 1, "Winner must be consistent across calls")
+
+
+class RowDeduplicationTests(unittest.TestCase):
+    """Tests for deduplicate_adjacent_rows (A1 fix)."""
+
+    def _make_candidate(
+        self, name: str, row_texts: list[str]
+    ) -> tuple[str, list[list[str]], list[list[float]]]:
+        grid = app.empty_grid()
+        conf = app.empty_confidence_grid()
+        for row_idx, text in enumerate(row_texts):
+            for i, ch in enumerate(text):
+                col = app.FIRST_DATA_COL + i
+                if col <= app.LAST_DATA_COL and ch.strip():
+                    grid[row_idx][col] = ch
+                    conf[row_idx][col] = 0.9
+        return (name, grid, conf)
+
+    def _make_word_grid_from(
+        self, candidate: tuple[str, list[list[str]], list[list[float]]], rows: list[int]
+    ) -> tuple[list[list[str]], list[list[float]], list[str]]:
+        """Simulate per-row selection: pick ``candidate`` for the given rows."""
+        _, src_grid, src_conf = candidate
+        word_grid = app.empty_grid()
+        word_confidence = app.empty_confidence_grid()
+        row_sources: list[str] = [""] * app.ROWS
+        for r in rows:
+            word_grid[r] = src_grid[r][:]
+            word_confidence[r] = src_conf[r][:]
+            row_sources[r] = candidate[0]
+        return word_grid, word_confidence, row_sources
+
+    def test_duplicate_row_replaced_with_value(self):
+        """When row N+1 duplicates row N, deduplicate replaces it with the best non-duplicate."""
+        label = "CRZALT"
+        value = "FL204"
+        # candidate_a has label in both rows 0 and 1 (the duplication bug)
+        cand_a = self._make_candidate("a", [label, label] + [""] * 11)
+        # candidate_b has label in row 0, value in row 1 (the correct reading)
+        cand_b = self._make_candidate("b", [label, value] + [""] * 11)
+        word_candidates = [cand_a, cand_b]
+
+        # Simulate selection: row 0 from a (correct label position),
+        # row 1 accidentally also from a (duplicate)
+        word_grid, word_confidence, row_sources = self._make_word_grid_from(cand_a, [0, 1])
+
+        app.deduplicate_adjacent_rows(word_grid, word_confidence, word_candidates, row_sources)
+
+        row0 = "".join(word_grid[0][app.FIRST_DATA_COL : app.LAST_DATA_COL + 1]).strip()
+        row1 = "".join(word_grid[1][app.FIRST_DATA_COL : app.LAST_DATA_COL + 1]).strip()
+        self.assertNotEqual(row0, row1, "Row 1 should no longer duplicate row 0")
+
+    def test_value_row_survives_dedup(self):
+        """After deduplication the value candidate fills the value row."""
+        cand_a = self._make_candidate("a", ["ECON", "ECON"] + [""] * 11)
+        cand_b = self._make_candidate("b", ["ECON", ".860"] + [""] * 11)
+        word_candidates = [cand_a, cand_b]
+
+        word_grid, word_confidence, row_sources = self._make_word_grid_from(cand_a, [0, 1])
+        app.deduplicate_adjacent_rows(word_grid, word_confidence, word_candidates, row_sources)
+
+        row1 = "".join(word_grid[1][app.FIRST_DATA_COL : app.LAST_DATA_COL + 1]).strip()
+        self.assertIn(".", row1, "The value '.860' should now occupy row 1")
+
+    def test_non_duplicate_rows_untouched(self):
+        """Rows that differ from their neighbour are not modified."""
+        cand = self._make_candidate("a", ["CRZALT", "FL204"] + [""] * 11)
+        word_candidates = [cand]
+        word_grid, word_confidence, row_sources = self._make_word_grid_from(cand, [0, 1])
+
+        snapshot0 = word_grid[0][:]
+        snapshot1 = word_grid[1][:]
+        app.deduplicate_adjacent_rows(word_grid, word_confidence, word_candidates, row_sources)
+
+        self.assertEqual(word_grid[0], snapshot0, "Row 0 should be unchanged")
+        self.assertEqual(word_grid[1], snapshot1, "Row 1 should be unchanged")
+
+    def test_no_alternative_blanks_the_row(self):
+        """When every candidate duplicates the row above, the row is blanked."""
+        label = "OPTALT"
+        # Only one candidate with the same text in both rows
+        cand = self._make_candidate("a", [label, label] + [""] * 11)
+        word_candidates = [cand]
+        word_grid, word_confidence, row_sources = self._make_word_grid_from(cand, [0, 1])
+
+        app.deduplicate_adjacent_rows(word_grid, word_confidence, word_candidates, row_sources)
+
+        row1 = "".join(word_grid[1][app.FIRST_DATA_COL : app.LAST_DATA_COL + 1]).strip()
+        self.assertEqual(row1, "", "Row with no non-duplicate alternative should be blanked")
+
+
+class HousekeepingTests(unittest.TestCase):
+    """Tests for D1 (cleanup_exports), D2 (recheck validation), D3 (blur band)."""
+
+    def test_cleanup_exports_removes_old_docx(self):
+        """cleanup_exports must delete aged-out .docx files (D1)."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            exports = Path(tmpdir)
+            recent_docx = exports / "recent.docx"
+            old_docx = exports / "old.docx"
+            old_png = exports / "old.png"
+            for p in (recent_docx, old_docx, old_png):
+                p.write_bytes(b"x")
+            aged = time.time() - app.EXPORT_MAX_AGE_SECONDS - 10
+            os.utime(old_docx, (aged, aged))
+            os.utime(old_png, (aged, aged))
+
+            orig = app.EXPORTS
+            app.EXPORTS = exports
+            try:
+                app.cleanup_exports()
+            finally:
+                app.EXPORTS = orig
+
+            remaining = {p.name for p in exports.iterdir()}
+            self.assertNotIn("old.docx", remaining, "Aged .docx must be deleted")
+            self.assertNotIn("old.png", remaining, "Aged .png must be deleted")
+            self.assertIn("recent.docx", remaining, "Recent .docx must survive")
+
+    def test_whole_grid_recheck_calls_validate_field_formats(self):
+        """whole_grid_focused_recheck must include validate_field_formats (D2)."""
+        import inspect
+        src = inspect.getsource(app.whole_grid_focused_recheck)
+        self.assertIn("validate_field_formats", src)
+
+    def test_blur_warning_threshold_above_blur_threshold(self):
+        """BLUR_WARNING_THRESHOLD > BLUR_THRESHOLD defines the marginal band (D3)."""
+        self.assertGreater(app.BLUR_WARNING_THRESHOLD, app.BLUR_THRESHOLD)
+
+    def test_blur_warning_band_logic(self):
+        """A score in the marginal band must produce blurWarning=True, blurry=False (D3)."""
+        mid = (app.BLUR_THRESHOLD + app.BLUR_WARNING_THRESHOLD) / 2.0
+        blurry = mid > 0 and mid < app.BLUR_THRESHOLD
+        blur_warning = app.BLUR_THRESHOLD <= mid < app.BLUR_WARNING_THRESHOLD
+        self.assertFalse(blurry)
+        self.assertTrue(blur_warning)
+
+    def test_below_blur_threshold_is_blurry_not_warning(self):
+        """A score below BLUR_THRESHOLD must produce blurry=True, blurWarning=False (D3)."""
+        score = app.BLUR_THRESHOLD / 2.0
+        blurry = score > 0 and score < app.BLUR_THRESHOLD
+        blur_warning = app.BLUR_THRESHOLD <= score < app.BLUR_WARNING_THRESHOLD
+        self.assertTrue(blurry)
+        self.assertFalse(blur_warning)
 
 
 if __name__ == "__main__":

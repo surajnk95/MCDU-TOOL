@@ -60,7 +60,8 @@ MAX_SCREEN_H = 1400
 OCR_WHITELIST = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789°º˚/.-<>%:"
 MAX_REQUEST_BYTES = 50 * 1024 * 1024
 MAX_EXPORT_FILES = 80
-BLUR_THRESHOLD = 80.0   # variance-of-Laplacian below this → warn "image too blurry" (#25)
+BLUR_THRESHOLD = 80.0         # variance-of-Laplacian below this → blurry warning (#25)
+BLUR_WARNING_THRESHOLD = 150.0  # between BLUR_THRESHOLD and this → marginal quality (#D3)
 EXPORT_MAX_AGE_SECONDS = 7 * 24 * 60 * 60
 MCDU_WORD_HINTS = {
     "ACT",
@@ -186,17 +187,18 @@ def cleanup_exports() -> None:
     if not EXPORTS.exists():
         return
     now = time.time()
-    files = sorted(
-        (path for path in EXPORTS.iterdir() if path.is_file() and path.suffix.lower() == ".png"),
-        key=lambda path: path.stat().st_mtime,
-        reverse=True,
-    )
-    for index, path in enumerate(files):
-        try:
-            if index >= MAX_EXPORT_FILES or now - path.stat().st_mtime > EXPORT_MAX_AGE_SECONDS:
-                path.unlink()
-        except OSError:
-            continue
+    for suffix in (".png", ".docx"):  # D1: also age out exported Word files
+        files = sorted(
+            (path for path in EXPORTS.iterdir() if path.is_file() and path.suffix.lower() == suffix),
+            key=lambda path: path.stat().st_mtime,
+            reverse=True,
+        )
+        for index, path in enumerate(files):
+            try:
+                if index >= MAX_EXPORT_FILES or now - path.stat().st_mtime > EXPORT_MAX_AGE_SECONDS:
+                    path.unlink()
+            except OSError:
+                continue
 
 
 def json_response(handler: SimpleHTTPRequestHandler, status: int, payload: dict[str, Any]) -> None:
@@ -2525,6 +2527,7 @@ def whole_grid_focused_recheck(
 
     updated = recover_dash_lines(updated, warped) if mode in {"balanced", "aggressive"} else updated
     updated = disambiguate_o_zero(updated)
+    updated = validate_field_formats(updated)  # D2: same snapping as main analyze path
     updated = apply_corrections(updated)
     return normalize_grid_guards(updated), summary
 
@@ -2937,7 +2940,10 @@ def fuse_grids(grids: list[list[list[str]]]) -> tuple[list[list[str]], dict[str,
             if not votes:
                 empty += 1
                 continue
-            best = max(set(votes), key=votes.count)
+            # A4: deterministic tie-breaking — preserve first-occurrence order so
+            # that equal-count characters resolve to the one from the earliest grid.
+            unique_votes = list(dict.fromkeys(votes))
+            best = max(unique_votes, key=votes.count)
             fused[row][col] = best
             if len(set(votes)) == 1:
                 if len(votes) == len(grids):
@@ -3161,6 +3167,45 @@ def remember_templates(payload: dict[str, Any]) -> dict[str, Any]:
     return {"learned": learned, "characters": len(templates)}
 
 
+def deduplicate_adjacent_rows(
+    word_grid: list[list[str]],
+    word_confidence: list[list[float]],
+    word_candidates: list[tuple[str, list[list[str]], list[list[float]]]],
+    row_sources: list[str],
+) -> None:
+    """Replace rows that duplicate their neighbour above with the best non-duplicate candidate (A1).
+
+    Operates in-place.  For each row whose text is identical to the row above,
+    re-ranks ``word_candidates`` by plain score and picks the highest-scoring
+    candidate whose text differs from the row above.  If no such candidate
+    exists the row is blanked (empty strings), which is safer than showing
+    a spurious label repeat.
+    """
+    for row in range(1, ROWS):
+        above_text = row_string_from_cells(word_grid[row - 1]).strip()
+        this_text = row_string_from_cells(word_grid[row]).strip()
+        if not (above_text and this_text and above_text == this_text):
+            continue
+
+        def _score(candidate: tuple[str, list[list[str]], list[list[float]]], _r: int = row) -> float:
+            _, cg, cc = candidate
+            t = row_string_from_cells(cg[_r])
+            return mcdu_row_score(t) + sum(cc[_r][FIRST_DATA_COL : LAST_DATA_COL + 1]) * 2.0
+
+        ranked = sorted(word_candidates, key=_score, reverse=True)
+        replaced = False
+        for cname, cg, cc in ranked:
+            if row_string_from_cells(cg[row]).strip() != above_text:
+                word_grid[row] = cg[row][:]
+                word_confidence[row] = cc[row][:]
+                row_sources[row] = cname
+                replaced = True
+                break
+        if not replaced:
+            word_grid[row] = [""] * COLS
+            word_confidence[row] = [0.0] * COLS
+
+
 def analyze(payload: dict[str, Any]) -> dict[str, Any]:
     image = load_image(str(payload["image"]))
     corners = payload.get("corners")
@@ -3223,17 +3268,31 @@ def analyze(payload: dict[str, Any]) -> dict[str, Any]:
     word_confidence = empty_confidence_grid()
     row_sources: list[str] = []
     for row in range(ROWS):
-        def row_candidate_score(candidate: tuple[str, list[list[str]], list[list[float]]]) -> float:
+        def row_candidate_score(candidate: tuple[str, list[list[str]], list[list[float]]], _row: int = row) -> float:
             _, candidate_grid, candidate_confidence = candidate
-            text = row_string_from_cells(candidate_grid[row])
-            confidence_score = sum(candidate_confidence[row][FIRST_DATA_COL : LAST_DATA_COL + 1])
-            character_count = sum(bool(cell) for cell in candidate_grid[row][FIRST_DATA_COL : LAST_DATA_COL + 1])
-            return mcdu_row_score(text) + confidence_score * 2.0 + character_count * 0.5
+            text = row_string_from_cells(candidate_grid[_row])
+            confidence_score = sum(candidate_confidence[_row][FIRST_DATA_COL : LAST_DATA_COL + 1])
+            character_count = sum(bool(cell) for cell in candidate_grid[_row][FIRST_DATA_COL : LAST_DATA_COL + 1])
+            score = mcdu_row_score(text) + confidence_score * 2.0 + character_count * 0.5
+            # A1: penalize repeating the row just selected above, and bonus digit
+            # content that logically follows a vocabulary label row.
+            if _row > 0:
+                above_text = row_string_from_cells(word_grid[_row - 1]).strip()
+                this_text = text.strip()
+                if above_text and this_text and above_text == this_text:
+                    score -= 30.0
+                if above_text and any(w in above_text for w in MCDU_VOCABULARY if len(w) >= 3):
+                    if re.search(r"\d", text):
+                        score += 8.0
+            return score
 
         source_name, source_grid, source_confidence = max(word_candidates, key=row_candidate_score)
         word_grid[row] = source_grid[row][:]
         word_confidence[row] = source_confidence[row][:]
         row_sources.append(source_name)
+
+    # A1: post-selection safety net — replace any remaining adjacent duplicates
+    deduplicate_adjacent_rows(word_grid, word_confidence, word_candidates, row_sources)
 
     fusion_summary = None
     if paddle_words:
@@ -3285,6 +3344,7 @@ def analyze(payload: dict[str, Any]) -> dict[str, Any]:
         "verification": verification_summary,
         "blurScore": round(blur_score, 1),
         "blurry": blur_score > 0 and blur_score < BLUR_THRESHOLD,
+        "blurWarning": BLUR_THRESHOLD <= blur_score < BLUR_WARNING_THRESHOLD,  # D3: marginal band
     }
 
 
