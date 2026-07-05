@@ -12,6 +12,7 @@ import subprocess
 import tempfile
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 import uuid
 from http import HTTPStatus
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
@@ -62,6 +63,9 @@ MAX_REQUEST_BYTES = 50 * 1024 * 1024
 MAX_EXPORT_FILES = 80
 BLUR_THRESHOLD = 80.0         # variance-of-Laplacian below this → blurry warning (#25)
 BLUR_WARNING_THRESHOLD = 150.0  # between BLUR_THRESHOLD and this → marginal quality (#D3)
+_TSV_EARLY_WINNER_SCORE = 55.0  # C2: stop extra PSMs when a variant already scores this well
+_TSV_GIVEUP_SCORE = 5.0         # C2: give up on a variant after 2 PSMs if score this poor
+_STRIP_SKIP_CONFIDENCE = 0.72   # C3: skip per-row strip when mean filled-cell confidence >= this
 EXPORT_MAX_AGE_SECONDS = 7 * 24 * 60 * 60
 MCDU_WORD_HINTS = {
     "ACT",
@@ -1127,7 +1131,7 @@ def run_tesseract_tsv(image: Image.Image) -> list[dict[str, Any]]:
 
         candidates: list[list[dict[str, Any]]] = []
         last_error = ""
-        for psm in ("11", "12", "6", "3", "4"):
+        for i, psm in enumerate(("11", "12", "6", "3", "4")):
             command = [
                 TESSERACT,
                 str(source),
@@ -1149,34 +1153,42 @@ def run_tesseract_tsv(image: Image.Image) -> list[dict[str, Any]]:
                 ) from exc
             if completed.returncode != 0:
                 last_error = completed.stderr.strip()
-                continue
-
-            rows = csv.DictReader(io.StringIO(completed.stdout), delimiter="\t")
-            words: list[dict[str, Any]] = []
-            for row in rows:
-                text = clean_ocr_text((row.get("text") or "").strip())
-                if not text:
-                    continue
-                try:
-                    conf = float(row.get("conf") or -1)
-                except ValueError:
-                    conf = -1
-                if conf < 0:
-                    continue
-                words.append(
-                    {
-                        "text": text,
-                        "conf": conf,
-                        "left": int(row.get("left") or 0),
-                        "top": int(row.get("top") or 0),
-                        "width": int(row.get("width") or 0),
-                        "height": int(row.get("height") or 0),
-                        "psm": psm,
-                        "engine": "tesseract",
-                    }
-                )
-            if words:
-                candidates.append(words)
+            else:
+                rows = csv.DictReader(io.StringIO(completed.stdout), delimiter="\t")
+                words: list[dict[str, Any]] = []
+                for row in rows:
+                    text = clean_ocr_text((row.get("text") or "").strip())
+                    if not text:
+                        continue
+                    try:
+                        conf = float(row.get("conf") or -1)
+                    except ValueError:
+                        conf = -1
+                    if conf < 0:
+                        continue
+                    words.append(
+                        {
+                            "text": text,
+                            "conf": conf,
+                            "left": int(row.get("left") or 0),
+                            "top": int(row.get("top") or 0),
+                            "width": int(row.get("width") or 0),
+                            "height": int(row.get("height") or 0),
+                            "psm": psm,
+                            "engine": "tesseract",
+                        }
+                    )
+                if words:
+                    candidates.append(words)
+            # C2: after the first two PSM attempts, prune early: stop if the variant
+            # already has an excellent result, or has proven to yield nothing useful.
+            if i >= 1:
+                if candidates:
+                    _best_now = max(ocr_words_score(c, image.height) for c in candidates)
+                    if _best_now >= _TSV_EARLY_WINNER_SCORE or _best_now < _TSV_GIVEUP_SCORE:
+                        break
+                else:
+                    break  # no output at all after 2+ PSMs — skip remaining
         if not candidates and last_error:
             raise RuntimeError(last_error or "Tesseract OCR failed.")
         if not candidates:
@@ -1337,15 +1349,15 @@ def per_row_strip_ocr(
     grid = empty_grid()
     confidence_out = empty_confidence_grid()
 
+    # Pre-compute all row strips that pass the ink gate, then OCR them in parallel.
+    _strip_jobs: list[tuple[int, Image.Image, float]] = []
     for row in range(ROWS):
         y1 = max(0, int(origin_y + row * cell_h))
         y2 = min(warped.height, int(origin_y + (row + 1) * cell_h))
         x1 = max(0, int(origin_x + FIRST_DATA_COL * cell_w))
         x2 = min(warped.width, int(origin_x + (LAST_DATA_COL + 1) * cell_w))
-
         if x2 <= x1 or y2 <= y1:
             continue
-
         strip = warped.crop((x1, y1, x2, y2))
         # Ink gate: skip strips with almost no bright pixels. PSM 7 assumes the
         # input IS a line of text and will hallucinate low-confidence characters
@@ -1358,14 +1370,24 @@ def per_row_strip_ocr(
             (max(1, strip.width * scale), max(1, strip.height * scale)),
             Image.Resampling.LANCZOS,
         )
-        processed = preprocess_for_ocr(enlarged)
+        processed_strip = preprocess_for_ocr(enlarged)
         col_w_scaled = enlarged.width / max(1, data_cols)
+        _strip_jobs.append((row, processed_strip, col_w_scaled))
 
+    def _ocr_one_strip(
+        job: tuple[int, Image.Image, float],
+    ) -> tuple[int, list[dict[str, Any]], float]:
+        _row, _img, _col_w = job
         try:
-            words = _run_tesseract_single_line(processed)
+            return _row, _run_tesseract_single_line(_img), _col_w
         except Exception:  # noqa: BLE001 — supplemental pass; never block the main result
-            continue
+            return _row, [], _col_w
 
+    # C1: run all per-row strip OCR calls in parallel
+    with ThreadPoolExecutor(max_workers=min(max(len(_strip_jobs), 1), ROWS)) as _strip_pool:
+        _strip_results = list(_strip_pool.map(_ocr_one_strip, _strip_jobs))
+
+    for row, words, col_w_scaled in _strip_results:
         for word in words:
             text = normalize_mcdu_phrase(str(word.get("text", "")))
             compact = text.replace(" ", "")
@@ -3216,14 +3238,18 @@ def analyze(payload: dict[str, Any]) -> dict[str, Any]:
     warped = clean_warped_image(warped)  # #14/#15/#17: cursor / glare / outlines
     blur_score = compute_blur_score(warped)  # #25: quality gate
     screen_size = warped.size
-    ocr_candidates: list[tuple[float, str, Image.Image, list[dict[str, Any]]]] = []
-    for variant_name, variant_image in preprocessing_variants(warped):
-        variant_words = run_tesseract_tsv(variant_image)
-        ocr_candidates.append(
-            (ocr_words_score(variant_words, variant_image.height), variant_name, variant_image, variant_words)
-        )
+
+    # C1: run all variant TSV passes in parallel
+    _variants = preprocessing_variants(warped)
+    _t0 = time.perf_counter()
+    with ThreadPoolExecutor(max_workers=min(len(_variants), 8)) as _pool:
+        _all_words = list(_pool.map(lambda vi: run_tesseract_tsv(vi[1]), _variants))
+    _t_tsv = time.perf_counter() - _t0
+    ocr_candidates: list[tuple[float, str, Image.Image, list[dict[str, Any]]]] = [
+        (ocr_words_score(vwords, vimg.height), vname, vimg, vwords)
+        for (vname, vimg), vwords in zip(_variants, _all_words)
+    ]
     _, preprocessing_name, processed, words = max(ocr_candidates, key=lambda item: item[0])
-    boxes = run_tesseract_boxes(processed)
     # warp_screen already phase-aligns the image to the visible 40 x 13 lattice.
     # Re-fitting an OCR offset here would make extraction disagree with the grid
     # the user sees and edits in the browser.
@@ -3248,9 +3274,40 @@ def analyze(payload: dict[str, Any]) -> dict[str, Any]:
             place_word(box_grid, box_scores, box_confidence, word, geometry)
         word_candidates.append(("message_box", box_grid, box_confidence))
 
-    # #18: Per-row strip OCR — Tesseract --psm 7 on each isolated row strip
-    strip_grid, strip_conf = per_row_strip_ocr(warped, geometry)
+    # C3: skip per-row strip if existing word candidates are already high-confidence
+    _draft_conf = [[0.0] * COLS for _ in range(ROWS)]
+    for _, _cg, _cc in word_candidates:
+        for _r in range(ROWS):
+            for _c in range(FIRST_DATA_COL, LAST_DATA_COL + 1):
+                if _cg[_r][_c] and _cc[_r][_c] > _draft_conf[_r][_c]:
+                    _draft_conf[_r][_c] = _cc[_r][_c]
+    _filled_conf = [
+        _draft_conf[_r][_c]
+        for _r in range(ROWS)
+        for _c in range(FIRST_DATA_COL, LAST_DATA_COL + 1)
+        if _draft_conf[_r][_c] > 0
+    ]
+    _skip_strip = bool(_filled_conf) and sum(_filled_conf) / len(_filled_conf) >= _STRIP_SKIP_CONFIDENCE
+
+    # C1: run box pass and (optionally) per-row strip concurrently
+    _t1 = time.perf_counter()
+    with ThreadPoolExecutor(max_workers=2) as _pool:
+        _box_fut = _pool.submit(run_tesseract_boxes, processed)
+        _strip_fut = None if _skip_strip else _pool.submit(per_row_strip_ocr, warped, geometry)
+        boxes = _box_fut.result()
+        strip_grid, strip_conf = (
+            _strip_fut.result() if _strip_fut is not None else (empty_grid(), empty_confidence_grid())
+        )
+    _t_box_strip = time.perf_counter() - _t1
+
+    # #18: Per-row strip OCR — add to candidates (empty placeholder if C3 skip)
     word_candidates.append(("per_row", strip_grid, strip_conf))
+    print(
+        f"[ocr-timing] variants={len(_variants)}"
+        f" tsv={_t_tsv:.2f}s"
+        f" box+strip={_t_box_strip:.2f}s"
+        f" strip={'skipped(C3)' if _skip_strip else 'run'}"
+    )
 
     hybrid_requested = bool(payload.get("hybridOcr", True))
     paddle_words: list[dict[str, Any]] = []
