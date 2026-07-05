@@ -65,17 +65,36 @@ _ATLAS_FONT_PATHS: list[str] = [
     # macOS
     "/System/Library/Fonts/Supplemental/Andale Mono.ttf",
     "/System/Library/Fonts/Supplemental/Courier New.ttf",
+    "/System/Library/Fonts/Supplemental/Courier New Bold.ttf",
     "/System/Library/Fonts/Supplemental/PTMono.ttc",
+    "/System/Library/Fonts/Monaco.ttf",
     # Linux
     "/usr/share/fonts/truetype/liberation/LiberationMono-Regular.ttf",
+    "/usr/share/fonts/truetype/liberation/LiberationMono-Bold.ttf",
     "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
+    "/usr/share/fonts/truetype/dejavu/DejaVuSansMono-Bold.ttf",
     "/usr/share/fonts/truetype/freefont/FreeMono.ttf",
     "/usr/share/fonts/truetype/ubuntu/UbuntuMono-R.ttf",
     # Windows
     "C:/Windows/Fonts/cour.ttf",
+    "C:/Windows/Fonts/courbd.ttf",
     "C:/Windows/Fonts/consola.ttf",
     "C:/Windows/Fonts/lucon.ttf",
 ]
+# B1: atlas classification on/off.  Off because cross-font accuracy caps at
+# ~75 % on SF Mono (the only available non-atlas system monospace), which is
+# below the 85 % threshold required for production use.
+ATLAS_ENABLED: bool = False
+# B1: canonical glyph patch dimensions for bbox-normalised atlas templates.
+_ATLAS_CANON_H: int = 28   # target glyph-content height inside template
+_ATLAS_CANON_W: int = 20   # target glyph-content width inside template
+_ATLAS_PAD_Y: int = 6      # padding above/below canonical region
+_ATLAS_PAD_X: int = 5      # padding left/right of canonical region
+_ATLAS_TMPL_H: int = _ATLAS_CANON_H + 2 * _ATLAS_PAD_Y   # 40
+_ATLAS_TMPL_W: int = _ATLAS_CANON_W + 2 * _ATLAS_PAD_X   # 30
+_ATLAS_THRESHOLD: float = 0.55   # minimum NCC score to accept a classification
+_ATLAS_MARGIN: float = 0.08      # minimum gap between 1st and 2nd-best scores
+_ATLAS_MAX_CONFIDENCE: float = 0.55  # cap on confidence written into grid
 MAX_REQUEST_BYTES = 50 * 1024 * 1024
 MAX_EXPORT_FILES = 80
 BLUR_THRESHOLD = 80.0         # variance-of-Laplacian below this → blurry warning (#25)
@@ -817,66 +836,176 @@ def save_templates(templates: dict[str, list[list[float]]]) -> None:
 
 # ─── Glyph Atlas — B1 ───────────────────────────────────────────────────────
 
-_GLYPH_ATLAS: dict[str, list[list[float]]] | None = None
+_GLYPH_ATLAS: dict[str, list[np.ndarray]] | None = None
 
 
-def _find_atlas_font(size: int = 14) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
-    """Return the best available monospace PIL font at *size* points."""
-    for path in _ATLAS_FONT_PATHS:
-        if Path(path).exists():
-            try:
-                return ImageFont.truetype(path, size)
-            except Exception:
-                continue
-    try:
-        return ImageFont.load_default(size=size)
-    except TypeError:
-        return ImageFont.load_default()
+def _atlas_bbox_normalize(arr: np.ndarray, threshold: float = 30.0) -> np.ndarray | None:
+    """Extract tight glyph bbox, resize to canonical size, return padded uint8 patch.
 
-
-def _build_glyph_atlas() -> dict[str, list[list[float]]]:
-    """Render OCR_WHITELIST chars at 3 variants (clean / blurred / thickened).
-
-    Each entry maps to a list of normalized 16×24 feature vectors, identical in
-    format to the user-learned templates so classify_from_templates applies
-    directly.  Three variants widen the matching envelope for real-world cell
-    crops that differ from a pristine render due to blur, bloom, or noise.
+    Returns a (_ATLAS_TMPL_H × _ATLAS_TMPL_W) uint8 array, or None when the
+    input contains no bright pixels.
     """
-    font = _find_atlas_font(size=14)
-    atlas: dict[str, list[list[float]]] = {}
+    mask = arr > threshold
+    if not mask.any():
+        return None
+    rows, cols = np.nonzero(mask)
+    r0, r1 = int(rows.min()), int(rows.max())
+    c0, c1 = int(cols.min()), int(cols.max())
+    glyph = arr[r0 : r1 + 1, c0 : c1 + 1].astype(np.float32)
+    gh, gw = glyph.shape
+    if gh < 2 or gw < 2:
+        return None
+    scale = min(_ATLAS_CANON_H / gh, _ATLAS_CANON_W / gw)
+    new_h = max(1, int(round(gh * scale)))
+    new_w = max(1, int(round(gw * scale)))
+    try:
+        import cv2 as _cv2
+        resized = _cv2.resize(glyph, (new_w, new_h), interpolation=_cv2.INTER_LINEAR)
+    except ImportError:
+        resized = np.asarray(
+            Image.fromarray(glyph).resize((new_w, new_h), Image.Resampling.BILINEAR),
+            dtype=np.float32,
+        )
+    out = np.zeros((_ATLAS_TMPL_H, _ATLAS_TMPL_W), dtype=np.float32)
+    y0 = _ATLAS_PAD_Y + (_ATLAS_CANON_H - new_h) // 2
+    x0 = _ATLAS_PAD_X + (_ATLAS_CANON_W - new_w) // 2
+    out[y0 : y0 + new_h, x0 : x0 + new_w] = resized
+    mx = float(out.max())
+    if mx > 0:
+        out = out * (255.0 / mx)
+    return out.astype(np.uint8)
 
-    for char in OCR_WHITELIST:
-        base = Image.new("L", (16, 24), 0)
-        draw = ImageDraw.Draw(base)
+
+def _atlas_ncc(a: np.ndarray, b: np.ndarray) -> float:
+    """Normalized cross-correlation (cosine similarity) for two same-size arrays."""
+    af = a.astype(np.float32) - float(a.mean())
+    bf = b.astype(np.float32) - float(b.mean())
+    na = float(np.linalg.norm(af))
+    nb = float(np.linalg.norm(bf))
+    if na < 1e-6 or nb < 1e-6:
+        return 0.0
+    return float(np.dot(af.flatten(), bf.flatten()) / (na * nb))
+
+
+def _build_glyph_atlas() -> dict[str, list[np.ndarray]]:
+    """Render alphanumeric OCR chars as bbox-normalised 2D image patches.
+
+    For each available atlas font, renders each character at 64 pt on a
+    200×200 canvas, extracts the tight glyph bounding box, resizes it to
+    the canonical (_ATLAS_CANON_H × _ATLAS_CANON_W) representation with
+    padding, and stores three variants (clean, blurred, thickened).
+
+    Returns {char: [uint8 ndarray of shape (_ATLAS_TMPL_H, _ATLAS_TMPL_W)]}.
+    """
+    atlas: dict[str, list[np.ndarray]] = {}
+    atlas_chars = [c for c in OCR_WHITELIST if c.isalnum()]
+
+    for path in _ATLAS_FONT_PATHS:
+        if not Path(path).exists():
+            continue
         try:
-            bbox = draw.textbbox((0, 0), char, font=font)
-            gw = bbox[2] - bbox[0]
-            gh = bbox[3] - bbox[1]
-            x = (16 - gw) // 2 - bbox[0]
-            y = (24 - gh) // 2 - bbox[1]
-            draw.text((x, y), char, fill=255, font=font)
+            font = ImageFont.truetype(path, 64)
         except Exception:
             continue
 
-        base_arr = np.asarray(base, dtype=np.float32)
-        if base_arr.max() < 10:
-            continue
+        for char in atlas_chars:
+            canvas = Image.new("L", (200, 200), 0)
+            draw = ImageDraw.Draw(canvas)
+            try:
+                bb = draw.textbbox((0, 0), char, font=font)
+                x = 100 - (bb[2] - bb[0]) // 2 - bb[0]
+                y = 100 - (bb[3] - bb[1]) // 2 - bb[1]
+                draw.text((x, y), char, fill=255, font=font)
+            except Exception:
+                continue
 
-        atlas[char] = [
-            _normalize_cell_patch(base_arr.copy()),
-            _normalize_cell_patch(np.asarray(base.filter(ImageFilter.GaussianBlur(0.8)), dtype=np.float32)),
-            _normalize_cell_patch(np.asarray(base.filter(ImageFilter.MaxFilter(3)), dtype=np.float32)),
-        ]
+            base_arr = np.asarray(canvas, dtype=np.uint8)
+            if base_arr.max() < 10:
+                continue
+
+            tmpl = _atlas_bbox_normalize(base_arr.astype(np.float32))
+            if tmpl is None:
+                continue
+            blur = _atlas_bbox_normalize(
+                np.asarray(
+                    Image.fromarray(base_arr).filter(ImageFilter.GaussianBlur(1.5)),
+                    dtype=np.float32,
+                )
+            )
+            thick = _atlas_bbox_normalize(
+                np.asarray(
+                    Image.fromarray(base_arr).filter(ImageFilter.MaxFilter(3)),
+                    dtype=np.float32,
+                )
+            )
+            atlas.setdefault(char, []).extend(v for v in [tmpl, blur, thick] if v is not None)
 
     return atlas
 
 
-def _get_glyph_atlas() -> dict[str, list[list[float]]]:
+def _get_glyph_atlas() -> dict[str, list[np.ndarray]]:
     """Return the cached glyph atlas, building it once on first call (B1)."""
     global _GLYPH_ATLAS
     if _GLYPH_ATLAS is None:
         _GLYPH_ATLAS = _build_glyph_atlas()
     return _GLYPH_ATLAS
+
+
+def _atlas_classify_patch(
+    cell_arr: np.ndarray,
+    atlas: dict[str, list[np.ndarray]],
+) -> tuple[str, float] | None:
+    """Core atlas classifier: bbox-normalise *cell_arr* then NCC vs each template.
+
+    Returns (char, score) or None when the ink gate fires, the score is below
+    _ATLAS_THRESHOLD, or the best-vs-second margin is less than _ATLAS_MARGIN.
+    """
+    if float(np.mean(cell_arr > 40)) < 0.005:
+        return None
+    norm = _atlas_bbox_normalize(cell_arr.astype(np.float32))
+    if norm is None:
+        return None
+    scores: dict[str, float] = {}
+    for char, templates in atlas.items():
+        best = -1.0
+        for tmpl in templates:
+            s = _atlas_ncc(norm, tmpl)
+            if s > best:
+                best = s
+        scores[char] = best
+    if not scores:
+        return None
+    ranked = sorted(scores.items(), key=lambda x: x[1], reverse=True)
+    best_char, best_score = ranked[0]
+    if best_score < _ATLAS_THRESHOLD:
+        return None
+    margin = best_score - ranked[1][1] if len(ranked) >= 2 else best_score
+    if margin < _ATLAS_MARGIN:
+        return None
+    return best_char, best_score
+
+
+def classify_cell_atlas(
+    image: Image.Image,
+    row: int,
+    col: int,
+    atlas: dict[str, list[np.ndarray]],
+) -> tuple[str, float] | None:
+    """Classify a warped-image grid cell against the pre-seeded glyph atlas (B1).
+
+    Extracts the cell crop, applies the ink gate, bbox-normalises the glyph,
+    and runs NCC against every atlas template.  Returns (char, score) or None.
+    """
+    screen_w, screen_h = image.size
+    cell_w = screen_w / COLS
+    cell_h = screen_h / ROWS
+    x0 = int(max(0, col * cell_w))
+    y0 = int(max(0, row * cell_h))
+    x1 = int(min(screen_w, (col + 1) * cell_w))
+    y1 = int(min(screen_h, (row + 1) * cell_h))
+    crop = max_channel_gray(image.crop((x0, y0, x1, y1)))
+    cell_arr = np.asarray(crop, dtype=np.uint8)
+    return _atlas_classify_patch(cell_arr, atlas)
 
 
 # ────────────────────────────────────────────────────────────────────────────
@@ -1956,11 +2085,12 @@ def fuse_atlas_grid(
     atlas_grid: list[list[str]],
     atlas_confidence: list[list[float]],
 ) -> tuple[list[list[str]], list[list[float]]]:
-    """Fuse B1 atlas results into *grid* additively.
+    """Fill empty cells from atlas results (B1, fill-only).
 
-    A cell is updated from the atlas only when the atlas confidence exceeds the
-    existing confidence — so a high-confidence Tesseract or PaddleOCR result is
-    never overwritten.  Empty cells (confidence 0.0) are always fillable.
+    The atlas may only write to a cell that is currently empty in *grid*.  Any
+    cell that already carries text — regardless of its confidence — is left
+    unchanged.  Atlas confidence is capped at _ATLAS_MAX_CONFIDENCE (0.55) so
+    it never outranks a later Tesseract correction.
     """
     out = [row[:] for row in grid]
     out_conf = [row[:] for row in confidence]
@@ -1968,9 +2098,9 @@ def fuse_atlas_grid(
         for col in range(FIRST_DATA_COL, LAST_DATA_COL + 1):
             if not atlas_grid[row][col]:
                 continue
-            if not out[row][col] or atlas_confidence[row][col] > out_conf[row][col]:
+            if not out[row][col]:
                 out[row][col] = atlas_grid[row][col]
-                out_conf[row][col] = atlas_confidence[row][col]
+                out_conf[row][col] = min(atlas_confidence[row][col], _ATLAS_MAX_CONFIDENCE)
     return out, out_conf
 
 
@@ -3478,20 +3608,24 @@ def analyze(payload: dict[str, Any]) -> dict[str, Any]:
     char_grid, char_confidence = build_character_grid(boxes, geometry)
     grid, confidence_grid = merge_ocr_grids(word_grid, word_confidence, char_grid, char_confidence)
 
-    # B1: classify every grid cell against the pre-seeded glyph atlas and fuse
-    # the results additively (higher-confidence existing cells are never touched).
-    _atlas = _get_glyph_atlas()
-    if _atlas:
-        _atlas_grid = empty_grid()
-        _atlas_conf = empty_confidence_grid()
-        for _ar in range(ROWS):
-            for _ac in range(FIRST_DATA_COL, LAST_DATA_COL + 1):
-                _res = classify_from_templates(cell_feature(warped, _ar, _ac), _atlas)
-                if _res is not None:
-                    _char, _dist = _res
-                    _atlas_grid[_ar][_ac] = _char
-                    _atlas_conf[_ar][_ac] = max(0.30, min(0.75, (0.25 - _dist) * 3.0))
-        grid, confidence_grid = fuse_atlas_grid(grid, confidence_grid, _atlas_grid, _atlas_conf)
+    # B1: atlas glyph classifier (fill-only: only writes to cells empty after
+    # Tesseract/PaddleOCR merge).  Disabled: cross-font accuracy caps at ~75 %
+    # with available system fonts, below the 85 % production threshold.
+    if ATLAS_ENABLED:
+        _atlas = _get_glyph_atlas()
+        if _atlas:
+            _atlas_grid = empty_grid()
+            _atlas_conf = empty_confidence_grid()
+            for _ar in range(ROWS):
+                for _ac in range(FIRST_DATA_COL, LAST_DATA_COL + 1):
+                    _res = classify_cell_atlas(warped, _ar, _ac, _atlas)
+                    if _res is not None:
+                        _char, _score = _res
+                        _atlas_grid[_ar][_ac] = _char
+                        _atlas_conf[_ar][_ac] = _score
+            grid, confidence_grid = fuse_atlas_grid(
+                grid, confidence_grid, _atlas_grid, _atlas_conf
+            )
 
     grid = recover_dash_lines(grid, warped)
     grid = apply_templates(grid, warped)

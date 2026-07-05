@@ -1465,77 +1465,104 @@ class HousekeepingTests(unittest.TestCase):
 class AtlasTests(unittest.TestCase):
     """Tests for the B1 pre-seeded glyph-atlas engine."""
 
-    def test_atlas_has_entries_for_whitelist_chars(self):
-        """_build_glyph_atlas must produce entries for the majority of OCR_WHITELIST."""
+    def _get_atlas(self):
         atlas = app._build_glyph_atlas()
-        # All ASCII chars in the whitelist should render; exotic ones (°º˚) may not
-        ascii_chars = [c for c in app.OCR_WHITELIST if ord(c) < 128]
-        found = sum(1 for c in ascii_chars if c in atlas)
-        self.assertGreaterEqual(found, len(ascii_chars) * 0.80,
-                                "Atlas should cover at least 80% of ASCII whitelist chars")
+        if not atlas:
+            self.skipTest("No atlas fonts available on this system")
+        return atlas
 
-    def test_atlas_feature_vectors_are_384(self):
-        """Every atlas feature vector must have length 16×24 = 384."""
-        atlas = app._build_glyph_atlas()
-        for char, features in atlas.items():
-            self.assertGreater(len(features), 0, f"No variants for '{char}'")
-            for feat in features:
-                self.assertEqual(len(feat), 384,
-                                 f"Feature vector for '{char}' has wrong length {len(feat)}")
-
-    def test_atlas_self_recognition(self):
-        """The atlas should recognize a cleanly rendered glyph at low distance."""
-        atlas = app._build_glyph_atlas()
-        self.assertIn("A", atlas, "Atlas must contain 'A'")
-        # Build the same feature vector the atlas stores for clean 'A'
-        font = app._find_atlas_font(size=14)
-        img = Image.new("L", (16, 24), 0)
+    def _render_large(self, char, font, size=200):
+        img = Image.new("L", (size, size), 0)
         draw = ImageDraw.Draw(img)
-        bbox = draw.textbbox((0, 0), "A", font=font)
-        gw = bbox[2] - bbox[0]
-        gh = bbox[3] - bbox[1]
-        x = (16 - gw) // 2 - bbox[0]
-        y = (24 - gh) // 2 - bbox[1]
-        draw.text((x, y), "A", fill=255, font=font)
-        feature = app._normalize_cell_patch(np.asarray(img, dtype=np.float32))
-        result = app.classify_from_templates(feature, atlas)
-        self.assertIsNotNone(result, "Atlas must recognize its own clean render")
-        char, dist = result
-        self.assertEqual(char, "A", f"Expected 'A', got '{char}'")
-        self.assertLess(dist, 0.05, f"Self-recognition distance too high: {dist:.4f}")
+        bb = draw.textbbox((0, 0), char, font=font)
+        x = size // 2 - (bb[2] - bb[0]) // 2 - bb[0]
+        y = size // 2 - (bb[3] - bb[1]) // 2 - bb[1]
+        draw.text((x, y), char, fill=255, font=font)
+        return np.asarray(img, dtype=np.uint8)
 
-    def test_atlas_does_not_recognise_blank_cell(self):
-        """A purely dark patch (empty cell) should produce no atlas match."""
-        atlas = app._build_glyph_atlas()
-        blank = np.zeros((24, 16), dtype=np.float32)
-        feature = app._normalize_cell_patch(blank)
-        result = app.classify_from_templates(feature, atlas)
-        self.assertIsNone(result, "Blank cell must not be matched by the atlas")
+    def test_atlas_has_entries_for_alphanumeric_chars(self):
+        """Atlas must cover at least 80 % of alphanumeric OCR whitelist chars."""
+        atlas = self._get_atlas()
+        alphanumeric = [c for c in app.OCR_WHITELIST if c.isalnum()]
+        found = sum(1 for c in alphanumeric if c in atlas)
+        self.assertGreaterEqual(
+            found, len(alphanumeric) * 0.80,
+            "Atlas should cover at least 80 % of alphanumeric whitelist chars",
+        )
 
-    def test_fuse_atlas_grid_additive_only(self):
-        """fuse_atlas_grid must never overwrite a higher-confidence existing cell."""
+    def test_atlas_templates_are_2d_uint8_arrays(self):
+        """Every atlas template must be a 2-D uint8 ndarray with the correct shape."""
+        atlas = self._get_atlas()
+        expected_shape = (app._ATLAS_TMPL_H, app._ATLAS_TMPL_W)
+        for char, templates in atlas.items():
+            self.assertGreater(len(templates), 0, f"No variants for '{char}'")
+            for t in templates:
+                self.assertIsInstance(t, np.ndarray, f"Template for '{char}' is not ndarray")
+                self.assertEqual(t.ndim, 2, f"Template for '{char}' is not 2-D")
+                self.assertEqual(
+                    t.shape, expected_shape,
+                    f"Template shape for '{char}': got {t.shape}, expected {expected_shape}",
+                )
+                self.assertEqual(t.dtype, np.uint8, f"Template dtype for '{char}' is {t.dtype}")
+
+    def test_atlas_blank_cell_returns_none(self):
+        """A blank (all-zero) cell patch must produce no atlas match."""
+        atlas = self._get_atlas()
+        blank = np.zeros((64, 40), dtype=np.uint8)
+        result = app._atlas_classify_patch(blank, atlas)
+        self.assertIsNone(result, "Blank cell must return None")
+
+    def test_atlas_confusable_pairs_never_wrong(self):
+        """For confusable pairs (0/O, 8/B, 5/S, 1/I) the atlas must never
+        return the wrong partner — correct or None are both acceptable."""
+        atlas = self._get_atlas()
+        # Use the first available atlas font for synthetic test cells
+        from pathlib import Path
+        from PIL import ImageFont
+        font_path = next(
+            (p for p in app._ATLAS_FONT_PATHS if Path(p).exists()), None
+        )
+        if font_path is None:
+            self.skipTest("No atlas font found")
+        font = ImageFont.truetype(font_path, 64)
+
+        confusable_pairs = [("0", "O"), ("8", "B"), ("5", "S"), ("1", "I")]
+        for a, b in confusable_pairs:
+            for test_char, wrong_partner in [(a, b), (b, a)]:
+                arr = self._render_large(test_char, font)
+                arr_b = np.asarray(
+                    Image.fromarray(arr).filter(ImageFilter.GaussianBlur(0.6)),
+                    dtype=np.uint8,
+                )
+                result = app._atlas_classify_patch(arr_b, atlas)
+                classified = result[0] if result is not None else None
+                self.assertNotEqual(
+                    classified, wrong_partner,
+                    f"'{test_char}' must not be classified as '{wrong_partner}' "
+                    f"(got {result!r})",
+                )
+
+    def test_fuse_atlas_grid_fill_only(self):
+        """fuse_atlas_grid must NEVER overwrite any non-empty cell (fill-only)."""
         grid = app.empty_grid()
         conf = app.empty_confidence_grid()
-        # High-confidence existing cell — should NOT be overwritten
-        grid[0][1] = "A"; conf[0][1] = 0.90
-        # Low-confidence existing cell — atlas wins if its confidence is higher
-        grid[0][2] = "B"; conf[0][2] = 0.20
-        # Empty cell — atlas always wins
-        # col 3 stays empty
+        grid[0][1] = "A"; conf[0][1] = 0.90  # high-confidence — must survive
+        grid[0][2] = "B"; conf[0][2] = 0.10  # low-confidence — must also survive
+        # col 3 empty — atlas may fill it
 
         ag = app.empty_grid()
         ac = app.empty_confidence_grid()
-        ag[0][1] = "X"; ac[0][1] = 0.50   # lower than 0.90 → must NOT overwrite
-        ag[0][2] = "Y"; ac[0][2] = 0.50   # higher than 0.20 → must overwrite
-        ag[0][3] = "Z"; ac[0][3] = 0.50   # empty slot → must fill
+        ag[0][1] = "X"; ac[0][1] = 0.80   # atlas > existing → still must NOT overwrite
+        ag[0][2] = "Y"; ac[0][2] = 0.80   # atlas > existing → still must NOT overwrite
+        ag[0][3] = "Z"; ac[0][3] = 0.80   # empty slot → atlas MUST fill
 
         out_g, out_c = app.fuse_atlas_grid(grid, conf, ag, ac)
-        self.assertEqual(out_g[0][1], "A",  "High-confidence cell must not be overwritten")
+        self.assertEqual(out_g[0][1], "A", "High-confidence non-empty cell must not be overwritten")
         self.assertAlmostEqual(out_c[0][1], 0.90)
-        self.assertEqual(out_g[0][2], "Y",  "Low-confidence cell must be replaced by better atlas match")
-        self.assertAlmostEqual(out_c[0][2], 0.50)
-        self.assertEqual(out_g[0][3], "Z",  "Empty cell must be filled by atlas")
-        self.assertAlmostEqual(out_c[0][3], 0.50)
+        self.assertEqual(out_g[0][2], "B", "Low-confidence non-empty cell must not be overwritten")
+        self.assertAlmostEqual(out_c[0][2], 0.10)
+        self.assertEqual(out_g[0][3], "Z", "Empty cell must be filled by atlas")
+        self.assertLessEqual(out_c[0][3], app._ATLAS_MAX_CONFIDENCE + 1e-9)
 
 
 if __name__ == "__main__":
