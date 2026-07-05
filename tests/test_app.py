@@ -1637,5 +1637,96 @@ class AtlasTests(unittest.TestCase):
         self.assertLessEqual(out_c[0][3], app._ATLAS_MAX_CONFIDENCE + 1e-9)
 
 
+class FuzzyPhraseTests(unittest.TestCase):
+    """B3: fuzzy phrase normalisation in normalize_mcdu_phrase."""
+
+    def test_fuzzy_normalizes_lrcspo_to_lrc_spd(self):
+        # "LRCSPO" is one character off from "LRCSPD" (→ "LRC SPD")
+        result = app.normalize_mcdu_phrase("LRCSPO")
+        self.assertEqual(result, "LRC SPD")
+
+    def test_fuzzy_does_not_fire_on_already_correct(self):
+        # Exact match in the table fires before the fuzzy loop; result unchanged
+        result = app.normalize_mcdu_phrase("LRC SPD")
+        self.assertEqual(result, "LRC SPD")
+
+    def test_fuzzy_does_not_fire_on_unrelated(self):
+        # "XYZABC" has no close match — must be returned unchanged
+        result = app.normalize_mcdu_phrase("XYZABC")
+        self.assertEqual(result, "XYZABC")
+
+
+class TitleRowTests(unittest.TestCase):
+    """A5 Part 2: snap_title_row snaps row 0 to the MCDU title vocabulary."""
+
+    def _make_grid_with_title(self, text: str, start_col: int = 15) -> list[list[str]]:
+        grid = app.empty_grid()
+        for i, ch in enumerate(text):
+            col = start_col + i
+            if app.FIRST_DATA_COL <= col <= app.LAST_DATA_COL:
+                grid[0][col] = ch if ch != " " else ""
+        return grid
+
+    def test_snap_title_row_corrects_one_char_typo(self):
+        # "ACT RTA CR2" — last char wrong; should snap to "ACT RTA CRZ"
+        grid = self._make_grid_with_title("ACT RTA CR2", start_col=14)
+        out = app.snap_title_row(grid)
+        title_text = "".join(out[0][c] or " " for c in range(14, 14 + 11)).strip()
+        self.assertEqual(title_text, "ACT RTA CRZ")
+
+    def test_snap_title_row_correct_title_unchanged(self):
+        # Exact match — cells must be byte-identical
+        grid = self._make_grid_with_title("ACT LRC D/D", start_col=14)
+        out = app.snap_title_row(grid)
+        for c in range(14, 14 + 11):
+            self.assertEqual(out[0][c], grid[0][c])
+
+    def test_snap_title_row_garbage_unchanged(self):
+        # Random noise that doesn't match anything — must be untouched
+        grid = self._make_grid_with_title("QQQQQQQQQQ", start_col=10)
+        original = [row[:] for row in grid]
+        out = app.snap_title_row(grid)
+        self.assertEqual(out[0], original[0])
+
+
+class CharSpacingTests(unittest.TestCase):
+    """B4: apply_char_box_spacing inserts blank cells where char boxes reveal gaps."""
+
+    def _make_geometry(self, cell_w: float = 40.0, cell_h: float = 60.0) -> dict:
+        return {"cell_w": cell_w, "cell_h": cell_h, "origin_x": 0.0, "origin_y": 0.0}
+
+    def _make_box(self, left: float, top: float, w: float, h: float, text: str = "X") -> dict:
+        return {"left": left, "top": top, "width": w, "height": h, "text": text}
+
+    def test_apply_char_box_spacing_inserts_gap(self):
+        # Two boxes at adjacent cols 5 & 6 with centre gap of 70 px (> 1.7 × 40).
+        # cx_a = 195 + 10 = 205 → col int(205/40) = 5
+        # cx_b = 265 + 10 = 275 → col int(275/40) = 6
+        # gap = 275 - 205 = 70 > 1.7 × 40 = 68 → blank inserted at col 6, B shifts to 7
+        geo = self._make_geometry(cell_w=40.0, cell_h=60.0)
+        grid = app.empty_grid()
+        grid[0][5] = "A"
+        grid[0][6] = "B"
+        box_a = self._make_box(left=195.0, top=10.0, w=20.0, h=40.0, text="A")
+        box_b = self._make_box(left=265.0, top=10.0, w=20.0, h=40.0, text="B")
+        out = app.apply_char_box_spacing(grid, [box_a, box_b], geo)
+        self.assertEqual(out[0][5], "A", "col 5 must keep A")
+        self.assertEqual(out[0][6], "", "col 6 must be blank (gap inserted)")
+        self.assertEqual(out[0][7], "B", "col 7 must have B shifted right")
+
+    def test_apply_char_box_spacing_leaves_correct_spacing_unchanged(self):
+        # Two boxes with close centres (< 1.7×cell_w) — no shift should happen
+        geo = self._make_geometry(cell_w=40.0, cell_h=60.0)
+        grid = app.empty_grid()
+        grid[0][5] = "A"
+        grid[0][6] = "B"
+        box_a = self._make_box(left=195.0, top=10.0, w=20.0, h=40.0, text="A")  # cx=205
+        box_b = self._make_box(left=235.0, top=10.0, w=20.0, h=40.0, text="B")  # cx=245, gap=40 < 68
+        out = app.apply_char_box_spacing(grid, [box_a, box_b], geo)
+        self.assertEqual(out[0][5], "A")
+        self.assertEqual(out[0][6], "B")
+        self.assertEqual(out[0][7], "")
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -181,6 +181,22 @@ MCDU_PHRASE_REPLACEMENTS = (
     ("KOFIETA/FUEL", "KBFI ETA/FUEL"),
     ("ETA/FUEL", "ETA/FUEL"),
     ("ETAFUEL", "ETA/FUEL"),
+    ("LRCSPD", "LRC SPD"),  # B3: enables fuzzy correction of one-char variants (LRCSPO etc.)
+)
+# Closed vocabulary of MCDU page titles used by snap_title_row (A5).
+# Variable fields (M.xxx, xxxKT, RTE #) are handled separately with regex.
+MCDU_TITLE_VOCABULARY: tuple[str, ...] = (
+    "ACT RTA CRZ",
+    "MOD RTA CRZ",
+    "ACT LRC D/D",
+    "MOD LRC D/D",
+    "ACT ECON CRZ",
+    "MOD ECON CRZ",
+    "ACT ECON D/D",
+    "MOD ECON D/D",
+    "RTA PROGRESS",
+    "DES FORECAST",
+    "OFFPATH DES",
 )
 
 
@@ -1798,6 +1814,22 @@ def normalize_mcdu_phrase(text: str) -> str:
             return f"{replacement}{suffix}"
         if source in core and len(core) <= len(source) + 4:
             return f"{core.replace(source, replacement)}{suffix}"
+    # B3: fuzzy phrase normalisation — catches single-character OCR substitutions.
+    # Only fires when there is exactly one close match (ratio ≥ 0.80) with a clear
+    # margin (≥ 0.10) over the second-best candidate.  Correct text is unchanged.
+    _b3_best_r = 0.0
+    _b3_best_repl: str | None = None
+    _b3_second_r = 0.0
+    for _src, _repl in MCDU_PHRASE_REPLACEMENTS:
+        _r = difflib.SequenceMatcher(None, core, _src).ratio()
+        if _r > _b3_best_r:
+            _b3_second_r = _b3_best_r
+            _b3_best_r = _r
+            _b3_best_repl = _repl
+        elif _r > _b3_second_r:
+            _b3_second_r = _r
+    if _b3_best_repl is not None and _b3_best_r >= 0.80 and _b3_best_r - _b3_second_r >= 0.10:
+        return f"{_b3_best_repl}{suffix}"
     for source, replacement in (
         ("RECHD", "RECMD"),
         ("NAX", "MAX"),
@@ -2043,6 +2075,61 @@ def merge_ocr_grids(
                 merged[row][col] = word
                 confidence[row][col] = word_confidence[row][col] if not char else min(word_confidence[row][col], 0.58)
     return normalize_grid_guards(merged), confidence
+
+
+def apply_char_box_spacing(
+    grid: list[list[str]],
+    boxes: list[dict[str, Any]],
+    geometry: dict[str, float],
+) -> list[list[str]]:
+    """B4: Restore spaces hidden by word-mode packing using per-character box positions.
+
+    Tesseract word mode returns one bounding box per word token, losing internal
+    spaces. When char boxes show a gap ≥ 1.7 × cell_w between the centres of boxes
+    assigned to adjacent columns, a blank cell should separate them. Cells right of
+    the gap are shifted one column rightward — but only when LAST_DATA_COL is empty
+    so no content is lost.
+    """
+    if not boxes:
+        return grid
+
+    cell_w = geometry["cell_w"]
+    cell_h = geometry["cell_h"]
+    origin_x = geometry["origin_x"]
+    origin_y = geometry["origin_y"]
+
+    updated = [row[:] for row in grid]
+
+    row_entries: dict[int, list[tuple[int, float]]] = {}
+    for box in boxes:
+        box_w = float(box.get("width") or 0)
+        box_h = float(box.get("height") or 0)
+        if box_w < 2 or box_h < 2 or box_w > cell_w * 2.15 or box_h > cell_h * 1.4:
+            continue
+        cx = float(box["left"]) + box_w * 0.5
+        cy = float(box["top"]) + box_h * 0.5
+        row_idx = max(0, min(ROWS - 1, int((cy - origin_y) / cell_h)))
+        col_idx = clamp_data_col(int((cx - origin_x) / cell_w))
+        row_entries.setdefault(row_idx, []).append((col_idx, cx))
+
+    for row_idx, entries in row_entries.items():
+        entries.sort(key=lambda t: t[1])
+        for i in range(len(entries) - 1):
+            col_a, cx_a = entries[i]
+            col_b, cx_b = entries[i + 1]
+            if col_b != col_a + 1:
+                continue
+            if not updated[row_idx][col_a] or not updated[row_idx][col_b]:
+                continue
+            if cx_b - cx_a <= cell_w * 1.7:
+                continue
+            if updated[row_idx][LAST_DATA_COL]:
+                continue
+            for c in range(LAST_DATA_COL, col_b, -1):
+                updated[row_idx][c] = updated[row_idx][c - 1]
+            updated[row_idx][col_b] = ""
+
+    return updated
 
 
 def fuse_engine_grids(
@@ -2843,6 +2930,7 @@ def whole_grid_focused_recheck(
     updated = recover_dash_lines(updated, warped) if mode in {"balanced", "aggressive"} else updated
     updated = disambiguate_o_zero(updated)
     updated = validate_field_formats(updated)  # D2: same snapping as main analyze path
+    updated = snap_title_row(updated)  # A5: title vocabulary snap
     updated = apply_corrections(updated)
     return normalize_grid_guards(updated), summary
 
@@ -3385,6 +3473,122 @@ def validate_field_formats(grid: list[list[str]]) -> list[list[str]]:
     return updated
 
 
+def detect_title_chip_text(
+    warped: Image.Image, geometry: dict[str, float]
+) -> list[tuple[int, str]]:
+    """A5 Part 1: OCR the inverse-video ACT/MOD chip in the title row.
+
+    The chip is a light-background rectangle with dark text. The global image
+    inversion used by the main OCR pipeline maps it to a dark background, causing
+    Tesseract to drop or mangle the text. This function crops the chip directly from
+    the warped image (correct polarity) and runs a dedicated Tesseract pass.
+    Returns (col_idx, char) pairs for row 0.
+    """
+    try:
+        import cv2
+    except ImportError:
+        return []
+
+    cell_w = geometry["cell_w"]
+    cell_h = geometry["cell_h"]
+    origin_x = geometry["origin_x"]
+    origin_y = geometry["origin_y"]
+    img_w, img_h = warped.size
+
+    row_y0 = max(0, int(origin_y))
+    row_y1 = min(img_h, int(origin_y + cell_h))
+    if row_y1 <= row_y0:
+        return []
+
+    rgb = np.asarray(warped.convert("RGB"), dtype=np.uint8)
+    strip = rgb[row_y0:row_y1, :, :]
+    hsv_strip = cv2.cvtColor(strip, cv2.COLOR_RGB2HSV)
+
+    # Bright (V > 160) and low-saturation (S < 50) = white/gray chip background
+    bright_mask = cv2.inRange(
+        hsv_strip,
+        np.array([0, 0, 160], dtype=np.uint8),
+        np.array([179, 50, 255], dtype=np.uint8),
+    )
+    min_chip_area = max(int(cell_w * cell_h * 1.5), 200)
+    num_labels, _labels, stats, _ = cv2.connectedComponentsWithStats(bright_mask, connectivity=8)
+
+    results: list[tuple[int, str]] = []
+    for i in range(1, num_labels):
+        area = int(stats[i, cv2.CC_STAT_AREA])
+        if area < min_chip_area:
+            continue
+        bx = int(stats[i, cv2.CC_STAT_LEFT])
+        bw = int(stats[i, cv2.CC_STAT_WIDTH])
+        bh = int(stats[i, cv2.CC_STAT_HEIGHT])
+        if bw < int(cell_w * 1.5) or bh < int(cell_h * 0.4):
+            continue
+        if area / max(1, bw * bh) < 0.55:
+            continue
+        chip_rgb = strip[:, bx : bx + bw, :]
+        if chip_rgb.size == 0:
+            continue
+        chip_img = Image.fromarray(chip_rgb, mode="RGB")
+        padded = ImageOps.expand(chip_img, border=4, fill=(255, 255, 255))
+        for word in run_tesseract_tsv(padded):
+            text = clean_ocr_text(str(word.get("text", "")))
+            if not text:
+                continue
+            wx = int(word.get("left", 0)) - 4 + bx
+            ww = int(word.get("width", 0))
+            cx = wx + ww * 0.5
+            col = clamp_data_col(int((cx - origin_x) / cell_w))
+            for j, ch in enumerate(text):
+                results.append((clamp_data_col(col + j), ch))
+    return results
+
+
+def snap_title_row(grid: list[list[str]]) -> list[list[str]]:
+    """A5 Part 2: Fuzzy-snap row 0 text to the nearest MCDU_TITLE_VOCABULARY entry.
+
+    Reads the non-empty cells of row 0, compares the joined text against the closed
+    vocabulary with difflib, and rewrites those cells only when there is an
+    unambiguous close match (ratio ≥ 0.70 over best, margin ≥ 0.10 over second-best).
+    Correct titles produce ratio == 1.0 and are left byte-identical; garbage that
+    matches nothing closely is untouched.
+    """
+    updated = [row[:] for row in grid]
+    row0 = updated[0]
+
+    non_empty = [c for c in range(FIRST_DATA_COL, LAST_DATA_COL + 1) if row0[c]]
+    if not non_empty:
+        return updated
+
+    start_col = non_empty[0]
+    end_col = non_empty[-1]
+    raw_text = "".join(row0[c] or " " for c in range(start_col, end_col + 1)).strip()
+    if not raw_text:
+        return updated
+
+    best_r = 0.0
+    best_entry: str | None = None
+    second_r = 0.0
+    for entry in MCDU_TITLE_VOCABULARY:
+        r = difflib.SequenceMatcher(None, raw_text, entry).ratio()
+        if r > best_r:
+            second_r = best_r
+            best_r = r
+            best_entry = entry
+        elif r > second_r:
+            second_r = r
+
+    if best_entry is None or best_r < 0.70 or best_r - second_r < 0.10:
+        return updated
+
+    for c in range(start_col, min(start_col + len(best_entry), LAST_DATA_COL + 1)):
+        ch = best_entry[c - start_col]
+        row0[c] = ch if ch != " " else ""
+    for c in range(start_col + len(best_entry), end_col + 1):
+        row0[c] = ""
+
+    return updated
+
+
 def _classify_cell_color(hsv_crop: np.ndarray) -> str:
     """Return the dominant text color in a cell's HSV crop (#23).
 
@@ -3654,6 +3858,7 @@ def analyze(payload: dict[str, Any]) -> dict[str, Any]:
         )
     char_grid, char_confidence = build_character_grid(boxes, geometry)
     grid, confidence_grid = merge_ocr_grids(word_grid, word_confidence, char_grid, char_confidence)
+    grid = apply_char_box_spacing(grid, boxes, geometry)  # B4
 
     # B1: atlas glyph classifier (fill-only: only writes to cells empty after
     # Tesseract/PaddleOCR merge).  Disabled: cross-font accuracy caps at ~75 %
@@ -3678,6 +3883,10 @@ def analyze(payload: dict[str, Any]) -> dict[str, Any]:
     grid = apply_templates(grid, warped)
     grid = disambiguate_o_zero(grid)
     grid = validate_field_formats(grid)  # #22: per-field format snapping
+    # A5: re-OCR inverse-video title chip then snap title to closed vocabulary
+    for _chip_col, _chip_ch in detect_title_chip_text(warped, geometry):
+        grid[0][_chip_col] = _chip_ch
+    grid = snap_title_row(grid)
     corrected_grid = apply_corrections(grid)
     verification_summary = None
     verification = payload.get("verification")
