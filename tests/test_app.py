@@ -1462,5 +1462,81 @@ class HousekeepingTests(unittest.TestCase):
         self.assertFalse(blur_warning)
 
 
+class AtlasTests(unittest.TestCase):
+    """Tests for the B1 pre-seeded glyph-atlas engine."""
+
+    def test_atlas_has_entries_for_whitelist_chars(self):
+        """_build_glyph_atlas must produce entries for the majority of OCR_WHITELIST."""
+        atlas = app._build_glyph_atlas()
+        # All ASCII chars in the whitelist should render; exotic ones (°º˚) may not
+        ascii_chars = [c for c in app.OCR_WHITELIST if ord(c) < 128]
+        found = sum(1 for c in ascii_chars if c in atlas)
+        self.assertGreaterEqual(found, len(ascii_chars) * 0.80,
+                                "Atlas should cover at least 80% of ASCII whitelist chars")
+
+    def test_atlas_feature_vectors_are_384(self):
+        """Every atlas feature vector must have length 16×24 = 384."""
+        atlas = app._build_glyph_atlas()
+        for char, features in atlas.items():
+            self.assertGreater(len(features), 0, f"No variants for '{char}'")
+            for feat in features:
+                self.assertEqual(len(feat), 384,
+                                 f"Feature vector for '{char}' has wrong length {len(feat)}")
+
+    def test_atlas_self_recognition(self):
+        """The atlas should recognize a cleanly rendered glyph at low distance."""
+        atlas = app._build_glyph_atlas()
+        self.assertIn("A", atlas, "Atlas must contain 'A'")
+        # Build the same feature vector the atlas stores for clean 'A'
+        font = app._find_atlas_font(size=14)
+        img = Image.new("L", (16, 24), 0)
+        draw = ImageDraw.Draw(img)
+        bbox = draw.textbbox((0, 0), "A", font=font)
+        gw = bbox[2] - bbox[0]
+        gh = bbox[3] - bbox[1]
+        x = (16 - gw) // 2 - bbox[0]
+        y = (24 - gh) // 2 - bbox[1]
+        draw.text((x, y), "A", fill=255, font=font)
+        feature = app._normalize_cell_patch(np.asarray(img, dtype=np.float32))
+        result = app.classify_from_templates(feature, atlas)
+        self.assertIsNotNone(result, "Atlas must recognize its own clean render")
+        char, dist = result
+        self.assertEqual(char, "A", f"Expected 'A', got '{char}'")
+        self.assertLess(dist, 0.05, f"Self-recognition distance too high: {dist:.4f}")
+
+    def test_atlas_does_not_recognise_blank_cell(self):
+        """A purely dark patch (empty cell) should produce no atlas match."""
+        atlas = app._build_glyph_atlas()
+        blank = np.zeros((24, 16), dtype=np.float32)
+        feature = app._normalize_cell_patch(blank)
+        result = app.classify_from_templates(feature, atlas)
+        self.assertIsNone(result, "Blank cell must not be matched by the atlas")
+
+    def test_fuse_atlas_grid_additive_only(self):
+        """fuse_atlas_grid must never overwrite a higher-confidence existing cell."""
+        grid = app.empty_grid()
+        conf = app.empty_confidence_grid()
+        # High-confidence existing cell — should NOT be overwritten
+        grid[0][1] = "A"; conf[0][1] = 0.90
+        # Low-confidence existing cell — atlas wins if its confidence is higher
+        grid[0][2] = "B"; conf[0][2] = 0.20
+        # Empty cell — atlas always wins
+        # col 3 stays empty
+
+        ag = app.empty_grid()
+        ac = app.empty_confidence_grid()
+        ag[0][1] = "X"; ac[0][1] = 0.50   # lower than 0.90 → must NOT overwrite
+        ag[0][2] = "Y"; ac[0][2] = 0.50   # higher than 0.20 → must overwrite
+        ag[0][3] = "Z"; ac[0][3] = 0.50   # empty slot → must fill
+
+        out_g, out_c = app.fuse_atlas_grid(grid, conf, ag, ac)
+        self.assertEqual(out_g[0][1], "A",  "High-confidence cell must not be overwritten")
+        self.assertAlmostEqual(out_c[0][1], 0.90)
+        self.assertEqual(out_g[0][2], "Y",  "Low-confidence cell must be replaced by better atlas match")
+        self.assertAlmostEqual(out_c[0][2], 0.50)
+        self.assertEqual(out_g[0][3], "Z",  "Empty cell must be filled by atlas")
+        self.assertAlmostEqual(out_c[0][3], 0.50)
+
+
 if __name__ == "__main__":
     unittest.main()

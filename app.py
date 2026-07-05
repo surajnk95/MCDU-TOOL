@@ -27,7 +27,7 @@ from docx.shared import Pt
 import math
 
 import numpy as np
-from PIL import Image, ImageEnhance, ImageFilter, ImageOps
+from PIL import Image, ImageDraw, ImageEnhance, ImageFilter, ImageFont, ImageOps
 
 
 ROOT = Path(__file__).resolve().parent
@@ -59,6 +59,23 @@ SCREEN_W = 1600
 MIN_SCREEN_H = 900
 MAX_SCREEN_H = 1400
 OCR_WHITELIST = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789°º˚/.-<>%:"
+
+# B1: Candidate monospace font paths for the glyph atlas, tried in order.
+_ATLAS_FONT_PATHS: list[str] = [
+    # macOS
+    "/System/Library/Fonts/Supplemental/Andale Mono.ttf",
+    "/System/Library/Fonts/Supplemental/Courier New.ttf",
+    "/System/Library/Fonts/Supplemental/PTMono.ttc",
+    # Linux
+    "/usr/share/fonts/truetype/liberation/LiberationMono-Regular.ttf",
+    "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
+    "/usr/share/fonts/truetype/freefont/FreeMono.ttf",
+    "/usr/share/fonts/truetype/ubuntu/UbuntuMono-R.ttf",
+    # Windows
+    "C:/Windows/Fonts/cour.ttf",
+    "C:/Windows/Fonts/consola.ttf",
+    "C:/Windows/Fonts/lucon.ttf",
+]
 MAX_REQUEST_BYTES = 50 * 1024 * 1024
 MAX_EXPORT_FILES = 80
 BLUR_THRESHOLD = 80.0         # variance-of-Laplacian below this → blurry warning (#25)
@@ -696,6 +713,43 @@ def ocr_message_boxes(warped: Image.Image, geometry: dict) -> list[dict]:
     return words
 
 
+def _normalize_cell_patch(arr: np.ndarray) -> list[float]:
+    """Center the tight glyph bbox and apply zero-mean/unit-variance normalization.
+
+    Input: 16×24 float32 array (bright glyph on dark background).
+    Output: 384-element feature vector matching the format used by
+    cell_feature and classify_from_templates / feature_distance.
+    Used by both cell_feature (live OCR) and _build_glyph_atlas (B1).
+    """
+    arr = arr.astype(np.float32)
+    try:
+        import cv2  # noqa: F401
+        threshold_val = max(90.0, float(arr.mean() + arr.std() * 0.65))
+        mask = arr > threshold_val
+        if mask.any():
+            row_idx, col_idx = np.nonzero(mask)
+            r0, r1 = int(row_idx.min()), int(row_idx.max())
+            c0, c1 = int(col_idx.min()), int(col_idx.max())
+            glyph_h = r1 - r0 + 1
+            glyph_w = c1 - c0 + 1
+            centered = np.zeros((24, 16), dtype=np.float32)
+            dr = max(0, (24 - glyph_h) // 2)
+            dc = max(0, (16 - glyph_w) // 2)
+            src_h = min(glyph_h, 24 - dr)
+            src_w = min(glyph_w, 16 - dc)
+            centered[dr : dr + src_h, dc : dc + src_w] = arr[r0 : r0 + src_h, c0 : c0 + src_w]
+            arr = centered
+    except ImportError:
+        pass
+    mean = float(arr.mean())
+    std = float(arr.std())
+    if std > 1e-6:
+        arr = (arr - mean) / std
+    else:
+        arr = arr - mean
+    return arr.reshape(-1).tolist()
+
+
 def cell_feature(image: Image.Image, row: int, col: int) -> list[float]:
     """Extract a centered, normalized glyph patch for the given grid cell (#21).
 
@@ -716,35 +770,7 @@ def cell_feature(image: Image.Image, row: int, col: int) -> list[float]:
         int(min(screen_h, (row + 1) * cell_h + pad_y)),
     )
     crop = max_channel_gray(image.crop(box)).resize((16, 24), Image.Resampling.BILINEAR)
-    arr = np.asarray(crop).astype(np.float32)
-
-    try:
-        import cv2  # noqa: F401
-        threshold_val = max(90.0, float(arr.mean() + arr.std() * 0.65))
-        mask = arr > threshold_val
-        if mask.any():
-            row_idx, col_idx = np.nonzero(mask)
-            r0, r1 = int(row_idx.min()), int(row_idx.max())
-            c0, c1 = int(col_idx.min()), int(col_idx.max())
-            glyph_h = r1 - r0 + 1
-            glyph_w = c1 - c0 + 1
-            centered = np.zeros((24, 16), dtype=np.float32)
-            dr = max(0, (24 - glyph_h) // 2)
-            dc = max(0, (16 - glyph_w) // 2)
-            src_h = min(glyph_h, 24 - dr)
-            src_w = min(glyph_w, 16 - dc)
-            centered[dr : dr + src_h, dc : dc + src_w] = arr[r0 : r0 + src_h, c0 : c0 + src_w]
-            arr = centered
-    except ImportError:
-        pass
-
-    mean = float(arr.mean())
-    std = float(arr.std())
-    if std > 1e-6:
-        arr = (arr - mean) / std
-    else:
-        arr = arr - mean
-    return arr.reshape(-1).tolist()
+    return _normalize_cell_patch(np.asarray(crop).astype(np.float32))
 
 
 def feature_distance(a: list[float], b: list[float]) -> float:
@@ -788,6 +814,72 @@ def save_templates(templates: dict[str, list[list[float]]]) -> None:
     compact = {char: features[-30:] for char, features in templates.items() if features}
     TEMPLATES.write_text(json.dumps(compact), encoding="utf-8")
 
+
+# ─── Glyph Atlas — B1 ───────────────────────────────────────────────────────
+
+_GLYPH_ATLAS: dict[str, list[list[float]]] | None = None
+
+
+def _find_atlas_font(size: int = 14) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
+    """Return the best available monospace PIL font at *size* points."""
+    for path in _ATLAS_FONT_PATHS:
+        if Path(path).exists():
+            try:
+                return ImageFont.truetype(path, size)
+            except Exception:
+                continue
+    try:
+        return ImageFont.load_default(size=size)
+    except TypeError:
+        return ImageFont.load_default()
+
+
+def _build_glyph_atlas() -> dict[str, list[list[float]]]:
+    """Render OCR_WHITELIST chars at 3 variants (clean / blurred / thickened).
+
+    Each entry maps to a list of normalized 16×24 feature vectors, identical in
+    format to the user-learned templates so classify_from_templates applies
+    directly.  Three variants widen the matching envelope for real-world cell
+    crops that differ from a pristine render due to blur, bloom, or noise.
+    """
+    font = _find_atlas_font(size=14)
+    atlas: dict[str, list[list[float]]] = {}
+
+    for char in OCR_WHITELIST:
+        base = Image.new("L", (16, 24), 0)
+        draw = ImageDraw.Draw(base)
+        try:
+            bbox = draw.textbbox((0, 0), char, font=font)
+            gw = bbox[2] - bbox[0]
+            gh = bbox[3] - bbox[1]
+            x = (16 - gw) // 2 - bbox[0]
+            y = (24 - gh) // 2 - bbox[1]
+            draw.text((x, y), char, fill=255, font=font)
+        except Exception:
+            continue
+
+        base_arr = np.asarray(base, dtype=np.float32)
+        if base_arr.max() < 10:
+            continue
+
+        atlas[char] = [
+            _normalize_cell_patch(base_arr.copy()),
+            _normalize_cell_patch(np.asarray(base.filter(ImageFilter.GaussianBlur(0.8)), dtype=np.float32)),
+            _normalize_cell_patch(np.asarray(base.filter(ImageFilter.MaxFilter(3)), dtype=np.float32)),
+        ]
+
+    return atlas
+
+
+def _get_glyph_atlas() -> dict[str, list[list[float]]]:
+    """Return the cached glyph atlas, building it once on first call (B1)."""
+    global _GLYPH_ATLAS
+    if _GLYPH_ATLAS is None:
+        _GLYPH_ATLAS = _build_glyph_atlas()
+    return _GLYPH_ATLAS
+
+
+# ────────────────────────────────────────────────────────────────────────────
 
 def classify_from_templates(feature: list[float], templates: dict[str, list[list[float]]]) -> tuple[str, float] | None:
     best_char = ""
@@ -1856,6 +1948,30 @@ def fuse_engine_grids(
                     confidence[row][col] = min(0.72, primary_confidence[row][col])
                     summary["blanksFilled"] += 1
     return normalize_grid_guards(fused), confidence, summary
+
+
+def fuse_atlas_grid(
+    grid: list[list[str]],
+    confidence: list[list[float]],
+    atlas_grid: list[list[str]],
+    atlas_confidence: list[list[float]],
+) -> tuple[list[list[str]], list[list[float]]]:
+    """Fuse B1 atlas results into *grid* additively.
+
+    A cell is updated from the atlas only when the atlas confidence exceeds the
+    existing confidence — so a high-confidence Tesseract or PaddleOCR result is
+    never overwritten.  Empty cells (confidence 0.0) are always fillable.
+    """
+    out = [row[:] for row in grid]
+    out_conf = [row[:] for row in confidence]
+    for row in range(ROWS):
+        for col in range(FIRST_DATA_COL, LAST_DATA_COL + 1):
+            if not atlas_grid[row][col]:
+                continue
+            if not out[row][col] or atlas_confidence[row][col] > out_conf[row][col]:
+                out[row][col] = atlas_grid[row][col]
+                out_conf[row][col] = atlas_confidence[row][col]
+    return out, out_conf
 
 
 def connected_components(mask: np.ndarray) -> list[dict[str, Any]]:
@@ -3361,6 +3477,22 @@ def analyze(payload: dict[str, Any]) -> dict[str, Any]:
         )
     char_grid, char_confidence = build_character_grid(boxes, geometry)
     grid, confidence_grid = merge_ocr_grids(word_grid, word_confidence, char_grid, char_confidence)
+
+    # B1: classify every grid cell against the pre-seeded glyph atlas and fuse
+    # the results additively (higher-confidence existing cells are never touched).
+    _atlas = _get_glyph_atlas()
+    if _atlas:
+        _atlas_grid = empty_grid()
+        _atlas_conf = empty_confidence_grid()
+        for _ar in range(ROWS):
+            for _ac in range(FIRST_DATA_COL, LAST_DATA_COL + 1):
+                _res = classify_from_templates(cell_feature(warped, _ar, _ac), _atlas)
+                if _res is not None:
+                    _char, _dist = _res
+                    _atlas_grid[_ar][_ac] = _char
+                    _atlas_conf[_ar][_ac] = max(0.30, min(0.75, (0.25 - _dist) * 3.0))
+        grid, confidence_grid = fuse_atlas_grid(grid, confidence_grid, _atlas_grid, _atlas_conf)
+
     grid = recover_dash_lines(grid, warped)
     grid = apply_templates(grid, warped)
     grid = disambiguate_o_zero(grid)
