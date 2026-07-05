@@ -330,65 +330,112 @@ def perspective_coefficients(src: list[dict[str, float]], dst_size: tuple[int, i
     return solve_linear_system(matrix, values)
 
 
-def estimate_grid_origin(image: Image.Image) -> tuple[float, float]:
-    """Find the equal-grid phase whose internal boundaries cross the least ink."""
+def estimate_grid_origin(image: Image.Image) -> tuple[float, float, float, float]:
+    """Find the (origin, scale) pair per axis minimising ink at internal grid boundaries.
+
+    Returns (origin_x, origin_y, scale_x, scale_y).  Scale defaults to 1.0 when
+    evidence for a pitch correction is weak; origin defaults to 0.0 when evidence
+    for a phase correction is weak.  A correctly-pitched image produces
+    scale == 1.0 so that the caller can apply a byte-identical fast path.
+    """
     gray = np.asarray(ImageOps.grayscale(image), dtype=np.float32)
     if gray.size == 0:
-        return 0.0, 0.0
+        return 0.0, 0.0, 1.0, 1.0
     threshold = max(118.0, float(np.percentile(gray, 86)))
     ink = gray >= threshold
     if float(np.mean(ink)) < 0.002:
-        return 0.0, 0.0
+        return 0.0, 0.0, 1.0, 1.0
 
     height, width = ink.shape
 
-    def best_axis_origin(axis: int, length: int, count: int) -> float:
-        pitch = length / count
-        half_strip = max(1.0, pitch * 0.035)
-        candidates = np.linspace(-pitch * 0.45, pitch * 0.45, 145)
+    def best_axis_origin_and_scale(axis: int, length: int, count: int) -> tuple[float, float]:
+        """Return (origin, scale) for one axis."""
+        nominal_pitch = length / count
+        # Projected ink profile: mean ink fraction at each position along this axis,
+        # averaged over the middle 96% of the perpendicular axis to avoid edge artefacts.
         start_other = int((width if axis == 0 else height) * 0.02)
         end_other = int((width if axis == 0 else height) * 0.98)
-        scores: list[float] = []
-        for origin in candidates:
-            boundary_scores: list[float] = []
-            for boundary in range(1, count):
-                position = origin + boundary * pitch
-                low = max(0, int(math.floor(position - half_strip)))
-                high = min(length, int(math.ceil(position + half_strip)) + 1)
-                if high <= low:
-                    continue
-                strip = (
-                    ink[start_other:end_other, low:high]
-                    if axis == 0
-                    else ink[low:high, start_other:end_other]
-                )
-                if strip.size:
-                    boundary_scores.append(float(np.mean(strip)))
-            score = float(np.mean(boundary_scores)) if boundary_scores else 1.0
-            score += abs(float(origin)) / pitch * 0.0015
-            scores.append(score)
-        best_index = int(np.argmin(scores))
-        zero_index = int(np.argmin(np.abs(candidates)))
-        # Keep the border-aligned phase when the image does not contain enough
-        # evidence to materially improve it.
-        if scores[best_index] >= scores[zero_index] * 0.94:
-            return 0.0
-        return float(candidates[best_index])
+        if axis == 0:
+            profile = ink[start_other:end_other, :].mean(axis=0).astype(np.float64)
+        else:
+            profile = ink[:, start_other:end_other].mean(axis=1).astype(np.float64)
+        # Cumulative sum enables O(1) strip-mean lookups: mean(profile[lo:hi]) = (cum[hi]-cum[lo])/(hi-lo)
+        cum = np.concatenate([[0.0], np.cumsum(profile)])  # shape (length+1,)
 
-    return best_axis_origin(0, width, COLS), best_axis_origin(1, height, ROWS)
+        def raw_ink_scores(pitch: float, origins: np.ndarray) -> np.ndarray:
+            """Mean boundary ink fraction for each origin, vectorised over all origins at once."""
+            half_strip = max(1.0, pitch * 0.035)
+            totals = np.zeros(len(origins), dtype=np.float64)
+            for boundary in range(1, count):
+                positions = origins + boundary * pitch
+                low_arr = np.clip(np.floor(positions - half_strip).astype(int), 0, length)
+                high_arr = np.clip(np.ceil(positions + half_strip).astype(int) + 1, 0, length)
+                valid = high_arr > low_arr
+                denom = np.where(valid, high_arr - low_arr, 1)
+                strip_means = np.where(
+                    valid, (cum[high_arr] - cum[low_arr]) / denom, 0.0
+                )
+                totals += strip_means
+            return totals / max(1, count - 1)
+
+        phase_candidates = np.linspace(-nominal_pitch * 0.45, nominal_pitch * 0.45, 145)
+        scale_candidates = np.linspace(0.97, 1.03, 13)
+
+        # Baseline: best achievable raw ink score at scale == 1.0 over all phase candidates.
+        nominal_raw = raw_ink_scores(nominal_pitch, phase_candidates)
+        best_nominal_raw = float(np.min(nominal_raw))
+
+        # Search non-unit scales for a strictly better (origin, scale) pair.
+        best_scale = 1.0
+        best_origin_nonu = 0.0
+        best_raw_nonu = best_nominal_raw  # start equal; only improve if strictly lower
+
+        for sc in scale_candidates:
+            if abs(sc - 1.0) < 1e-9:
+                continue
+            pitch = nominal_pitch * sc
+            origins = np.linspace(-pitch * 0.45, pitch * 0.45, 145)
+            raw = raw_ink_scores(pitch, origins)
+            idx = int(np.argmin(raw))
+            if float(raw[idx]) < best_raw_nonu:
+                best_raw_nonu = float(raw[idx])
+                best_scale = float(sc)
+                best_origin_nonu = float(origins[idx])
+
+        # Safety: only deviate from scale==1.0 when evidence is strong (>6% ink reduction).
+        if best_scale != 1.0 and best_raw_nonu < best_nominal_raw * 0.94:
+            return best_origin_nonu, best_scale
+
+        # Fall back to scale==1.0 with existing phase safety threshold.
+        nominal_with_penalty = nominal_raw + np.abs(phase_candidates) / nominal_pitch * 0.0015
+        best_phase_idx = int(np.argmin(nominal_with_penalty))
+        zero_idx = int(np.argmin(np.abs(phase_candidates)))
+        if nominal_with_penalty[best_phase_idx] >= nominal_with_penalty[zero_idx] * 0.94:
+            return 0.0, 1.0
+        return float(phase_candidates[best_phase_idx]), 1.0
+
+    ox, sx = best_axis_origin_and_scale(0, width, COLS)
+    oy, sy = best_axis_origin_and_scale(1, height, ROWS)
+    return ox, oy, sx, sy
 
 
 def align_warp_to_grid(image: Image.Image) -> tuple[Image.Image, tuple[float, float]]:
-    origin_x, origin_y = estimate_grid_origin(image)
-    if abs(origin_x) < 0.1 and abs(origin_y) < 0.1:
+    origin_x, origin_y, scale_x, scale_y = estimate_grid_origin(image)
+    scale_is_unity = abs(scale_x - 1.0) < 1e-9 and abs(scale_y - 1.0) < 1e-9
+    if abs(origin_x) < 0.1 and abs(origin_y) < 0.1 and scale_is_unity:
         return image, (0.0, 0.0)
+    # PIL AFFINE maps destination→source: src_x = scale_x*dst_x + origin_x.
+    # When scale != 1 the pitch is corrected; after the transform the grid sits at
+    # its nominal position, so we return (0,0) for the browser grid-alignment offset.
     aligned = image.transform(
         image.size,
         Image.Transform.AFFINE,
-        (1.0, 0.0, origin_x, 0.0, 1.0, origin_y),
+        (scale_x, 0.0, origin_x, 0.0, scale_y, origin_y),
         Image.Resampling.BICUBIC,
         fillcolor=(0, 0, 0),
     )
+    if not scale_is_unity:
+        return aligned, (0.0, 0.0)
     return aligned, (origin_x, origin_y)
 
 

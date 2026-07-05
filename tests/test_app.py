@@ -75,9 +75,11 @@ class DisplayGeometryTests(unittest.TestCase):
                     (center_x - 8, center_y - 8, center_x + 8, center_y + 8),
                     fill="white",
                 )
-        origin_x, origin_y = app.estimate_grid_origin(image)
+        origin_x, origin_y, scale_x, scale_y = app.estimate_grid_origin(image)
         self.assertAlmostEqual(origin_x, target_x, delta=1.5)
         self.assertAlmostEqual(origin_y, target_y, delta=1.5)
+        self.assertAlmostEqual(scale_x, 1.0, places=6)
+        self.assertAlmostEqual(scale_y, 1.0, places=6)
 
     def test_border_lines_refine_a_skewed_phone_photo(self) -> None:
         try:
@@ -124,6 +126,76 @@ class DisplayGeometryTests(unittest.TestCase):
         geometry = app.calibrate_grid([], (1600, 1300))
         self.assertEqual(geometry["origin_x"], 0.0)
         self.assertEqual(geometry["origin_y"], 0.0)
+
+
+class PitchCorrectionTests(unittest.TestCase):
+    """Tests for A2: per-axis scale / pitch correction in estimate_grid_origin."""
+
+    def _make_grid_image(
+        self,
+        width: int,
+        height: int,
+        pitch_x: float,
+        pitch_y: float,
+        char_fill_ratio: float = 0.55,
+    ) -> "app.Image.Image":
+        """Render solid rectangles at every data cell at the given pitches."""
+        image = app.Image.new("RGB", (width, height), "black")
+        draw = ImageDraw.Draw(image)
+        char_w = pitch_x * char_fill_ratio
+        char_h = pitch_y * char_fill_ratio
+        for row in range(app.ROWS):
+            for col in range(app.FIRST_DATA_COL, app.LAST_DATA_COL + 1):
+                cx = (col + 0.5) * pitch_x
+                cy = (row + 0.5) * pitch_y
+                draw.rectangle(
+                    (cx - char_w / 2, cy - char_h / 2, cx + char_w / 2, cy + char_h / 2),
+                    fill="white",
+                )
+        return image
+
+    def test_well_aligned_image_returns_unit_scale(self) -> None:
+        """A correctly-pitched image must produce scale == 1.0 on both axes."""
+        width, height = app.SCREEN_W, 520
+        pitch_x = width / app.COLS   # exactly nominal
+        pitch_y = height / app.ROWS  # exactly nominal
+        image = self._make_grid_image(width, height, pitch_x, pitch_y)
+        _, _, scale_x, scale_y = app.estimate_grid_origin(image)
+        self.assertAlmostEqual(scale_x, 1.0, places=6,
+                               msg=f"Expected scale_x=1.0, got {scale_x}")
+        self.assertAlmostEqual(scale_y, 1.0, places=6,
+                               msg=f"Expected scale_y=1.0, got {scale_y}")
+
+    def test_well_aligned_image_is_not_transformed(self) -> None:
+        """align_warp_to_grid must return the original image object for a well-aligned image."""
+        width, height = app.SCREEN_W, 520
+        pitch_x = width / app.COLS
+        pitch_y = height / app.ROWS
+        image = self._make_grid_image(width, height, pitch_x, pitch_y)
+        result, offsets = app.align_warp_to_grid(image)
+        self.assertIs(result, image,
+                      "No transform should be applied when pitch and phase are both correct")
+        self.assertEqual(offsets, (0.0, 0.0))
+
+    def test_wrong_pitch_image_recovers_scale(self) -> None:
+        """estimate_grid_origin must detect and return a pitch correction for a 1.5% pitch error."""
+        drift = 0.015  # 1.5% — one of the linspace(0.97, 1.03, 13) grid points
+        width, height = app.SCREEN_W, 520
+        nominal_pitch_x = width / app.COLS    # 40.0
+        pitch_x = nominal_pitch_x * (1 + drift)  # 40.6
+        pitch_y = height / app.ROWS           # 40.0 (no y-axis drift)
+        # fill_ratio=0.88 → gap width ≈ 4.9 px; a 0.5-step scale error (1.01 vs 1.015)
+        # shifts boundary ~3.8 px at the image edges, pushing it outside the gap and
+        # producing a noticeably higher ink score, making 1.015 the clear winner.
+        image = self._make_grid_image(width, height, pitch_x, pitch_y, char_fill_ratio=0.88)
+        _, _, scale_x, scale_y = app.estimate_grid_origin(image)
+        self.assertAlmostEqual(
+            scale_x, 1.0 + drift, delta=0.003,
+            msg=f"Expected scale_x≈{1+drift:.3f}, got {scale_x:.4f}",
+        )
+        # Y axis has no drift — must stay at 1.0
+        self.assertAlmostEqual(scale_y, 1.0, places=4,
+                               msg=f"Expected scale_y=1.0, got {scale_y}")
 
 
 class CorrectionSafetyTests(unittest.TestCase):
