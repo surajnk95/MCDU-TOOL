@@ -257,3 +257,15 @@ suite: render a known 13x40 grid in a monospace font on a black screen (optional
 warp/blur), run the pipeline, assert the grid reads back. Optionally keep 2-3 heavily
 downscaled real photos (~200 KB) as fixtures. This would have caught both the
 orientation bug and A1.
+
+## P2-F. Finding from the regression harness (Phase 3 candidate)
+
+Building the P2-E synthetic harness surfaced a real weakness: the per-row
+variant selection in analyze() confuses content between rows when rows have low
+mcdu_row_score (short numerics, single words) — high-scoring content from an
+adjacent row can win the wrong row. The harness grid was set to compound
+high-score strings to get a stable 100% baseline, so it does NOT guard against
+this. Worth a Phase 3 item: make row selection position-aware (a candidate's
+word y-centres must fall within the row's band) so it cannot borrow content
+from neighbouring rows. This is the same class of issue as A1 (label
+duplication) and likely explains several garbled rows on the real photos.
