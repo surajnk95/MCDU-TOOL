@@ -269,3 +269,13 @@ this. Worth a Phase 3 item: make row selection position-aware (a candidate's
 word y-centres must fall within the row's band) so it cannot borrow content
 from neighbouring rows. This is the same class of issue as A1 (label
 duplication) and likely explains several garbled rows on the real photos.
+
+## P3 note — pre-existing double-letter limitation (found during Prompt B)
+
+merge_ocr_grids' same_nearby guard drops a char-source character when the word
+grid has the same character within ±2 columns. This correctly suppresses
+cross-source shift duplicates, but also drops a LEGITIMATE double letter when
+the word source read it as single and the char source supplied the missing one
+(e.g. word "AL" + char "L" -> "AL", not "ALL"). Pre-existing (not introduced by
+Prompt B). Low frequency. A position-aware fix (compare source word x-extents)
+would resolve it; fold into P2-F if that round happens.

@@ -2087,7 +2087,10 @@ def merge_ocr_grids(
                     for nearby_col in range(max(FIRST_DATA_COL, col - 1), min(LAST_DATA_COL, col + 1) + 1)
                 )
                 degree_context = char == "°" and any(value.isdigit() for value in adjacent)
-                if degree_context or (left_context and right_context and not same_nearby):
+                adj_dup = (col > FIRST_DATA_COL and merged[row][col - 1] == char) or (
+                    col < LAST_DATA_COL and word_grid[row][col + 1] == char
+                )
+                if degree_context or (left_context and right_context and not same_nearby and not adj_dup):
                     merged[row][col] = char
                     confidence[row][col] = min(char_confidence[row][col], 0.72)
             elif word:
@@ -2143,6 +2146,8 @@ def apply_char_box_spacing(
             if cx_b - cx_a <= cell_w * 1.7:
                 continue
             if updated[row_idx][LAST_DATA_COL]:
+                continue
+            if updated[row_idx][col_b] == updated[row_idx][col_a]:
                 continue
             for c in range(LAST_DATA_COL, col_b, -1):
                 updated[row_idx][c] = updated[row_idx][c - 1]

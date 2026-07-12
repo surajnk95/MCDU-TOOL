@@ -1689,6 +1689,79 @@ class TitleRowTests(unittest.TestCase):
         self.assertEqual(out[0], original[0])
 
 
+class MergeOcrGridsAdjDupTests(unittest.TestCase):
+    """Adjacent-duplicate guard in merge_ocr_grids (cross-source and same-source)."""
+
+    def _grids(self):
+        return (
+            app.empty_grid(), app.empty_confidence_grid(),
+            app.empty_grid(), app.empty_confidence_grid(),
+        )
+
+    def _w(self, wg, wc, row, col, ch):
+        wg[row][col] = ch
+        wc[row][col] = 0.92
+
+    def _c(self, cg, cc, row, col, ch):
+        cg[row][col] = ch
+        cc[row][col] = 0.80
+
+    def test_merge_ppos_cross_source_suppressed(self):
+        """Char-source 'PP' at adjacent cols (word has context but no 'P' within ±2) →
+        adj_dup guard keeps only the first 'P' and drops the duplicate."""
+        wg, wc, cg, cc = self._grids()
+        self._w(wg, wc, 0, 1, "A")   # left context for col 2
+        self._w(wg, wc, 0, 4, "O")   # right context for col 2 AND left context for col 3
+        self._w(wg, wc, 0, 5, "S")   # right context for col 3
+        self._c(cg, cc, 0, 2, "P")   # first char-source P
+        self._c(cg, cc, 0, 3, "P")   # adjacent char-source P (duplicate)
+
+        merged, _ = app.merge_ocr_grids(wg, wc, cg, cc)
+
+        self.assertEqual(merged[0][2], "P", "First 'P' at col 2 must be kept")
+        self.assertEqual(merged[0][3], "", "Adjacent duplicate 'P' at col 3 must be suppressed")
+
+    def test_merge_indexx_extra_char_suppressed(self):
+        """Char-source 'X' immediately right of word-source 'X' is suppressed
+        (same_nearby guard: word_grid[col-1]=='X' within ±2)."""
+        wg, wc, cg, cc = self._grids()
+        for col, ch in zip(range(1, 7), "<INDEX"):
+            self._w(wg, wc, 0, col, ch)
+            self._c(cg, cc, 0, col, ch)
+        self._c(cg, cc, 0, 7, "X")   # spurious extra X from char-box mode
+
+        merged, _ = app.merge_ocr_grids(wg, wc, cg, cc)
+
+        self.assertEqual(merged[0][6], "X", "Real 'X' at col 6 must remain")
+        self.assertEqual(merged[0][7], "", "Spurious extra 'X' at col 7 must be suppressed")
+
+    def test_merge_same_source_ll_preserved(self):
+        """'LL' in 'ALL ENG' where both sources agree goes via branch-1; adj_dup
+        never fires in branch-2 so both L's survive."""
+        wg, wc, cg, cc = self._grids()
+        for col, ch in zip(range(1, 8), "ALL ENG"):
+            if ch != " ":
+                self._w(wg, wc, 0, col, ch)
+                self._c(cg, cc, 0, col, ch)
+
+        merged, _ = app.merge_ocr_grids(wg, wc, cg, cc)
+
+        self.assertEqual(merged[0][2], "L", "First L of ALL must be present")
+        self.assertEqual(merged[0][3], "L", "Second L of ALL must be present — same-source doubles must survive")
+
+    def test_merge_same_source_ss_preserved(self):
+        """'SS' where both sources agree must survive intact."""
+        wg, wc, cg, cc = self._grids()
+        for col, ch in zip(range(1, 7), "ASSIGN"):
+            self._w(wg, wc, 0, col, ch)
+            self._c(cg, cc, 0, col, ch)
+
+        merged, _ = app.merge_ocr_grids(wg, wc, cg, cc)
+
+        self.assertEqual(merged[0][2], "S", "First S must be present")
+        self.assertEqual(merged[0][3], "S", "Second S must be present")
+
+
 class CharSpacingTests(unittest.TestCase):
     """B4: apply_char_box_spacing inserts blank cells where char boxes reveal gaps."""
 
@@ -1726,6 +1799,34 @@ class CharSpacingTests(unittest.TestCase):
         self.assertEqual(out[0][5], "A")
         self.assertEqual(out[0][6], "B")
         self.assertEqual(out[0][7], "")
+
+    def test_spacing_adj_dup_shift_skipped(self):
+        # Adjacent identical chars with a large gap: shift must be skipped.
+        # cx_a=205 (col 5), cx_b=275 (col 6), gap=70 > 1.7×40=68 → would normally shift
+        # but col_a==col_b=='P' → guard fires → no shift, 'PP' stays at cols 5-6.
+        geo = self._make_geometry(cell_w=40.0, cell_h=60.0)
+        grid = app.empty_grid()
+        grid[0][5] = "P"
+        grid[0][6] = "P"
+        box_a = self._make_box(left=195.0, top=10.0, w=20.0, h=40.0, text="P")  # cx=205 → col 5
+        box_b = self._make_box(left=265.0, top=10.0, w=20.0, h=40.0, text="P")  # cx=275 → col 6
+        out = app.apply_char_box_spacing(grid, [box_a, box_b], geo)
+        self.assertEqual(out[0][5], "P", "col 5 must keep P")
+        self.assertEqual(out[0][6], "P", "col 6 must keep P (shift skipped for same chars)")
+        self.assertEqual(out[0][7], "", "col 7 must be empty")
+
+    def test_spacing_different_chars_shift_proceeds(self):
+        # Adjacent different chars with large gap: shift proceeds normally.
+        geo = self._make_geometry(cell_w=40.0, cell_h=60.0)
+        grid = app.empty_grid()
+        grid[0][5] = "P"
+        grid[0][6] = "O"
+        box_a = self._make_box(left=195.0, top=10.0, w=20.0, h=40.0, text="P")  # cx=205 → col 5
+        box_b = self._make_box(left=265.0, top=10.0, w=20.0, h=40.0, text="O")  # cx=275 → col 6
+        out = app.apply_char_box_spacing(grid, [box_a, box_b], geo)
+        self.assertEqual(out[0][5], "P", "col 5 must keep P")
+        self.assertEqual(out[0][6], "", "col 6 must be blank (gap inserted)")
+        self.assertEqual(out[0][7], "O", "col 7 must have O shifted right")
 
 
 class DateTokenSnapTests(unittest.TestCase):
