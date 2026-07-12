@@ -1728,5 +1728,69 @@ class CharSpacingTests(unittest.TestCase):
         self.assertEqual(out[0][7], "")
 
 
+class DateTokenSnapTests(unittest.TestCase):
+    """_snap_date_token: MCDU date format correction with OCR confusion handling."""
+
+    # --- real observed failures ---
+
+    def test_13char_multi_confusion_real_failure(self):
+        # "AUG07OCT02/25" misread as "AUGOZOGT02725":
+        #   0→O (digit read as letter), 7→Z, C→G, /→7
+        self.assertEqual(app._snap_date_token("AUGOZOGT02725"), "AUG07OCT02/25")
+
+    def test_13char_zero_for_o_in_oct(self):
+        # disambiguate_o_zero artefact: the "O" in OCT is after digit "7",
+        # so it gets converted to "0", producing "AUG070CT02/25"
+        self.assertEqual(app._snap_date_token("AUG070CT02/25"), "AUG07OCT02/25")
+
+    def test_13char_sep_s_confused_with_5(self):
+        # "S" in SEP read as "5"; slash read as "7"
+        self.assertEqual(app._snap_date_token("5EP04OCT02725"), "SEP04OCT02/25")
+
+    def test_8char_slash_read_as_7(self):
+        # Simple 8-char date with "/" misread as "7"
+        self.assertEqual(app._snap_date_token("JAN01725"), "JAN01/25")
+
+    def test_13char_dec_c_confused_with_g(self):
+        # "C" in DEC read as "G" (shape confusion)
+        self.assertEqual(app._snap_date_token("AUG07DEG02/25"), "AUG07DEC02/25")
+
+    # --- already-correct tokens must pass through unchanged ---
+
+    def test_8char_correct_unchanged(self):
+        self.assertIsNone(app._snap_date_token("JAN01/25"))
+
+    def test_13char_correct_unchanged(self):
+        self.assertIsNone(app._snap_date_token("AUG07OCT02/25"))
+
+    def test_13char_sep_correct_unchanged(self):
+        self.assertIsNone(app._snap_date_token("SEP04OCT02/25"))
+
+    # --- tokens that do NOT fit the date shape must be rejected ---
+
+    def test_non_date_13char_rejected(self):
+        # Starts with "ACT" which is not a month
+        self.assertIsNone(app._snap_date_token("ACTRTACRZABCD"))
+
+    def test_wrong_length_11_rejected(self):
+        self.assertIsNone(app._snap_date_token("AUG07OCT/25"))
+
+    def test_wrong_length_14_rejected(self):
+        self.assertIsNone(app._snap_date_token("AUGOZOGT027250"))
+
+    def test_unknown_month_rejected(self):
+        # "XYZ" is not a recognisable month under any confusion
+        self.assertIsNone(app._snap_date_token("XYZ07OCT02/25"))
+
+    def test_invalid_day_zero_rejected(self):
+        # Day "00" is not a valid calendar day
+        self.assertIsNone(app._snap_date_token("AUG00OCT02/25"))
+
+    def test_totally_unrelated_token_rejected(self):
+        self.assertIsNone(app._snap_date_token("FL390"))
+        self.assertIsNone(app._snap_date_token("RECMDSPD"))
+        self.assertIsNone(app._snap_date_token(".840"))
+
+
 if __name__ == "__main__":
     unittest.main()

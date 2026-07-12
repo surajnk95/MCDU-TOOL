@@ -49,6 +49,7 @@ MCDU_TESSERACT_PATTERNS = [
     r"\n\n\n\n\n",
     r"\n\n/\n\n",
     r"\n\n\n/\n\n\n",
+    r"+\n.\n/+\n.\n",   # DRAG/FF field: +0.0/+0.0
 ]
 
 ROWS = 13
@@ -58,7 +59,7 @@ LAST_DATA_COL = 38
 SCREEN_W = 1600
 MIN_SCREEN_H = 900
 MAX_SCREEN_H = 1400
-OCR_WHITELIST = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789°º˚/.-<>%:"
+OCR_WHITELIST = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789°º˚/.-<>%:+"
 
 # B1: Candidate monospace font paths for the glyph atlas, tried in order.
 _ATLAS_FONT_PATHS: list[str] = [
@@ -124,23 +125,33 @@ MCDU_WORD_HINTS = {
     "TO",
     "SEL",
     "FL",
+    "IDENT",
+    "INIT",
+    "DRAG",
+    "LPV",
 }
 MCDU_VOCABULARY = {
     "ACT",
+    "ACTIVE",
     "ALT",
     "ANRU",
     "CRZ",
     "DATA",
     "DES",
+    "DRAG",
     "ECON",
     "ENG",
     "FUEL",
     "GPS",
+    "IDENT",
     "INDEX",
+    "INIT",
     "IRU",
     "LEGS",
+    "LPV",
     "LRC",
     "MAX",
+    "MODEL",
     "NAV",
     "NM",
     "OFF",
@@ -148,7 +159,9 @@ MCDU_VOCABULARY = {
     "OPT",
     "OUT",
     "POS",
+    "PROGRAM",
     "RADIO",
+    "RATING",
     "RECMD",
     "REF",
     "RTA",
@@ -182,6 +195,12 @@ MCDU_PHRASE_REPLACEMENTS = (
     ("ETA/FUEL", "ETA/FUEL"),
     ("ETAFUEL", "ETA/FUEL"),
     ("LRCSPD", "LRC SPD"),  # B3: enables fuzzy correction of one-char variants (LRCSPO etc.)
+    # IDENT-page phrase pairs
+    ("ENGRATING", "ENG RATING"),
+    ("OPPROGRAM", "OP PROGRAM"),
+    ("NAVDATA", "NAV DATA"),
+    ("LPVDATA", "LPV DATA"),
+    ("POSINIT", "POS INIT"),
 )
 # Closed vocabulary of MCDU page titles used by snap_title_row (A5).
 # Variable fields (M.xxx, xxxKT, RTE #) are handled separately with regex.
@@ -3366,6 +3385,120 @@ def fuse_grids(grids: list[list[list[str]]]) -> tuple[list[list[str]], dict[str,
     return fused, summary
 
 
+_DATE_MONTHS: tuple[str, ...] = (
+    "JAN", "FEB", "MAR", "APR", "MAY", "JUN",
+    "JUL", "AUG", "SEP", "OCT", "NOV", "DEC",
+)
+# Observed char → correct char for LETTER positions in a month abbreviation.
+# Covers digit-looks-like-letter (0↔O, 5↔S, 1↔I) and letter shape confusion (G↔C).
+_DATE_LETTER_SUBS: dict[str, str] = {
+    "0": "O",
+    "5": "S",
+    "1": "I",
+    "G": "C",
+    "C": "G",
+}
+# Observed char → correct DIGIT for DAY / YEAR positions.
+_DATE_DIGIT_SUBS: dict[str, str] = {
+    "O": "0",
+    "S": "5",
+    "I": "1",
+    "Z": "7",
+}
+
+
+def _match_date_month(s: str) -> str | None:
+    """Return the canonical month name if *s* matches exactly one month under
+    known OCR confusions; return None if ambiguous or unrecognisable."""
+    if len(s) != 3:
+        return None
+    su = s.upper()
+    matches = []
+    for month in _DATE_MONTHS:
+        ok = True
+        for obs, exp in zip(su, month):
+            if obs == exp:
+                continue
+            if _DATE_LETTER_SUBS.get(obs) == exp:
+                continue
+            ok = False
+            break
+        if ok:
+            matches.append(month)
+    return matches[0] if len(matches) == 1 else None
+
+
+def _fix_date_dd(s: str) -> str | None:
+    """Correct a 2-char day string; return fixed digits or None if unrecognisable."""
+    if len(s) != 2:
+        return None
+    digits: list[str] = []
+    for ch in s.upper():
+        if ch.isdigit():
+            digits.append(ch)
+        elif ch in _DATE_DIGIT_SUBS:
+            digits.append(_DATE_DIGIT_SUBS[ch])
+        else:
+            return None
+    val = int("".join(digits))
+    return "".join(digits) if 1 <= val <= 31 else None
+
+
+def _fix_date_yy(s: str) -> str | None:
+    """Correct a 2-char year string; return fixed digits or None."""
+    if len(s) != 2:
+        return None
+    digits: list[str] = []
+    for ch in s.upper():
+        if ch.isdigit():
+            digits.append(ch)
+        elif ch in _DATE_DIGIT_SUBS:
+            digits.append(_DATE_DIGIT_SUBS[ch])
+        else:
+            return None
+    return "".join(digits)
+
+
+def _snap_date_token(text: str) -> str | None:
+    """Snap MMMDD/YY (8 chars) or MMMDDMMMDD/YY (13 chars) MCDU date tokens.
+
+    Corrects known OCR confusions — O↔0, Z↔7, G↔C, S↔5, I↔1 at any
+    position, plus '/' misread as '7' — as long as each position can be
+    explained by a known confusion pair.  Only fires when every month
+    abbreviation resolves to exactly one canonical month (unambiguous).
+    Returns None when the token does not fit the expected shape, is already
+    correct, or when month resolution is ambiguous.
+    """
+    n = len(text)
+    t = text.upper()
+
+    if n == 8:
+        # MMMDD/YY
+        m = _match_date_month(t[0:3])
+        d = _fix_date_dd(t[3:5])
+        sep = t[5] if t[5] in ("/", "7") else None
+        y = _fix_date_yy(t[6:8])
+        if m is None or d is None or sep is None or y is None:
+            return None
+        result = f"{m}{d}/{y}"
+        return None if result == text else result
+
+    if n == 13:
+        # MMMDDMMMDD/YY
+        m1 = _match_date_month(t[0:3])
+        d1 = _fix_date_dd(t[3:5])
+        m2 = _match_date_month(t[5:8])
+        d2 = _fix_date_dd(t[8:10])
+        sep = t[10] if t[10] in ("/", "7") else None
+        y = _fix_date_yy(t[11:13])
+        if m1 is None or d1 is None or m2 is None or d2 is None or sep is None or y is None:
+            return None
+        result = f"{m1}{d1}{m2}{d2}/{y}"
+        return None if result == text else result
+
+    return None
+
+
 def _snap_fl_token(text: str) -> str | None:
     """Snap to FL\\d{2,3} via one-character substitution; None if not applicable.
 
@@ -3441,7 +3574,11 @@ def validate_field_formats(grid: list[list[str]]) -> list[list[str]]:
     # Pass 1: standalone token-level snapping (no label context needed)
     for row in range(ROWS):
         for start, token in get_tokens(row):
-            snapped = _snap_fl_token(token) or _snap_decimal_token(token)
+            snapped = (
+                _snap_fl_token(token)
+                or _snap_decimal_token(token)
+                or _snap_date_token(token)
+            )
             if snapped:
                 apply_snap(row, start, token, snapped)
 
