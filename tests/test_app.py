@@ -1893,5 +1893,131 @@ class DateTokenSnapTests(unittest.TestCase):
         self.assertIsNone(app._snap_date_token(".840"))
 
 
+class RowPositionAwareTests(unittest.TestCase):
+    """P2-F: row-position quality weighting in score_candidate_row, and column-boundary snapping in place_word."""
+
+    # ---- helpers ----
+
+    def _make_candidate(self, row: int, text: str, conf: float, pos_q: list[float]) -> tuple:
+        grid = app.empty_grid()
+        confidence = app.empty_confidence_grid()
+        for i, ch in enumerate(text):
+            grid[row][app.FIRST_DATA_COL + i] = ch
+            confidence[row][app.FIRST_DATA_COL + i] = conf
+        return ("test", grid, confidence, pos_q)
+
+    def _word(self, left: float, top: float, text: str, cell_w: float = 40.0, cell_h: float = 100.0, conf: float = 90.0) -> dict:
+        return {
+            "text": text,
+            "left": left,
+            "top": top,
+            "width": len(text.replace(" ", "")) * cell_w,
+            "height": cell_h * 0.6,
+            "conf": conf,
+        }
+
+    def _geometry(self, cell_w: float = 40.0, cell_h: float = 100.0) -> dict:
+        return {"cell_w": cell_w, "cell_h": cell_h, "origin_x": 0.0, "origin_y": 0.0}
+
+    # ---- score_candidate_row: position quality weighting ----
+
+    def test_score_penalizes_boundary_word(self):
+        """A candidate whose words straddle a row boundary (pos_q=0.2) scores below a
+        well-centred candidate (pos_q=0.9) even when the straddling text has a higher
+        raw mcdu_row_score."""
+        word_grid = app.empty_grid()
+        pos_boundary = [1.0] * app.ROWS
+        pos_boundary[3] = 0.2  # near boundary → penalty
+        pos_centred = [1.0] * app.ROWS
+        pos_centred[3] = 0.9  # well centred → no penalty
+
+        # "RECMD" has higher mcdu_row_score than "MODEL" but will be penalised
+        cand_a = self._make_candidate(3, "RECMD", 0.9, pos_boundary)
+        cand_b = self._make_candidate(3, "MODEL", 0.9, pos_centred)
+
+        score_a = app.score_candidate_row(cand_a, 3, word_grid)
+        score_b = app.score_candidate_row(cand_b, 3, word_grid)
+        self.assertGreater(score_b, score_a,
+                           "Well-centred MODEL must beat boundary-straddling RECMD after penalty")
+
+    def test_score_no_penalty_when_well_centred(self):
+        """pos_q >= threshold (0.5) → no penalty; score is identical to the unweighted base."""
+        word_grid = app.empty_grid()
+        pos_high = [1.0] * app.ROWS
+        pos_high[2] = 0.9
+        pos_exact = [1.0] * app.ROWS
+        pos_exact[2] = 0.5  # exactly at threshold
+
+        cand_high = self._make_candidate(2, "FL350", 0.9, pos_high)
+        cand_thresh = self._make_candidate(2, "FL350", 0.9, pos_exact)
+
+        s_high = app.score_candidate_row(cand_high, 2, word_grid)
+        s_thresh = app.score_candidate_row(cand_thresh, 2, word_grid)
+        # Both should equal the same base score (neither is penalised)
+        self.assertEqual(s_high, s_thresh)
+
+    def test_score_empty_row_pos_quality_defaults_to_one(self):
+        """Rows with no words in the candidate get pos_q=1.0 and are never penalised."""
+        word_grid = app.empty_grid()
+        # pos_q list has 1.0 everywhere (row-isolated content, like per_row strip)
+        pos_all_one = [1.0] * app.ROWS
+        cand = self._make_candidate(5, "FL350", 0.9, pos_all_one)
+        score = app.score_candidate_row(cand, 5, word_grid)
+        # Score must be positive and equal to the penalty-free base
+        self.assertGreater(score, 0.0)
+
+    # ---- place_word: column boundary snap ----
+
+    def test_place_word_snaps_left_when_right_boundary_conflict(self):
+        """Word left edge at frac=0.8 (near right boundary); default round() → col 6,
+        but col 7 is occupied at high quality → snap to col 5 has fewer conflicts."""
+        geo = self._geometry()
+        grid = app.empty_grid()
+        scores = [[0.0] * app.COLS for _ in range(app.ROWS)]
+        conf = app.empty_confidence_grid()
+
+        # Pre-place high-quality content at col 7 (within the footprint of start_col=6)
+        grid[0][7] = "X"
+        scores[0][7] = 300.0
+
+        # raw_col = 5.8 → floor=5, frac=0.8 → round gives 6 (default); alt is 5
+        # footprint at start=6: cols 6,7 → col 7 hit (1 conflict)
+        # footprint at start=5: cols 5,6 → no hits (0 conflicts) → snap fires
+        word = self._word(left=5.8 * 40.0, top=20.0, text="AB")
+        app.place_word(grid, scores, conf, word, geo)
+
+        self.assertEqual(grid[0][5], "A", "Word should snap to col 5 to avoid col-7 conflict")
+        self.assertEqual(grid[0][6], "B")
+        self.assertEqual(grid[0][7], "X", "Pre-existing content at col 7 must be untouched")
+
+    def test_place_word_no_snap_when_frac_in_safe_zone(self):
+        """Word with frac=0.45 (not in the 0.25 boundary zone) must not snap — safety test."""
+        geo = self._geometry()
+        grid = app.empty_grid()
+        scores = [[0.0] * app.COLS for _ in range(app.ROWS)]
+        conf = app.empty_confidence_grid()
+
+        # raw_col = 5.45 → floor=5, frac=0.45 → round gives 5; frac not in [0,0.25] or [0.75,1]
+        word = self._word(left=5.45 * 40.0, top=20.0, text="AB")
+        app.place_word(grid, scores, conf, word, geo)
+
+        self.assertEqual(grid[0][5], "A", "Word cleanly in col 5 must start there (no snap)")
+        self.assertEqual(grid[0][6], "B")
+
+    def test_place_word_equal_conflicts_keeps_default(self):
+        """When both default and alt columns have equal conflicts, keep the default (byte-identical safety)."""
+        geo = self._geometry()
+        grid = app.empty_grid()
+        scores = [[0.0] * app.COLS for _ in range(app.ROWS)]
+        conf = app.empty_confidence_grid()
+
+        # Both col 5 and col 6 are empty → equal (0) conflicts → default start_col=6 is kept
+        word = self._word(left=5.8 * 40.0, top=20.0, text="AB")
+        app.place_word(grid, scores, conf, word, geo)
+
+        self.assertEqual(grid[0][6], "A", "With equal conflicts, default col 6 is kept")
+        self.assertEqual(grid[0][7], "B")
+
+
 if __name__ == "__main__":
     unittest.main()

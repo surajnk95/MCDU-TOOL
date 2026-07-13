@@ -1884,6 +1884,27 @@ def mcdu_row_score(text: str) -> float:
     return score
 
 
+def _row_pos_quality(words: list[dict[str, Any]], geometry: dict[str, float]) -> list[float]:
+    """Per-row word-position quality: 1.0 when words are centred in their row, 0.0 at a boundary.
+
+    Weighted by character count so long well-positioned words dominate.
+    Rows with no words default to 1.0 (no evidence of misplacement).
+    """
+    cell_h = geometry["cell_h"]
+    origin_y = geometry["origin_y"]
+    qual_sum = [0.0] * ROWS
+    char_sum = [0] * ROWS
+    for word in words:
+        cy = float(word.get("top", 0)) + float(word.get("height", 0)) * 0.5 - origin_y
+        r = max(0, min(ROWS - 1, int(cy / cell_h)))
+        frac = (cy - r * cell_h) / cell_h
+        centrality = max(0.0, 1.0 - 2.0 * abs(frac - 0.5))
+        n = max(1, len(normalize_mcdu_phrase(str(word.get("text", ""))).replace(" ", "")))
+        qual_sum[r] += centrality * n
+        char_sum[r] += n
+    return [qual_sum[r] / char_sum[r] if char_sum[r] > 0 else 1.0 for r in range(ROWS)]
+
+
 def row_string_from_cells(row: list[str]) -> str:
     return "".join(cell or " " for cell in row[:COLS]).rstrip()
 
@@ -2013,6 +2034,23 @@ def build_character_grid(
     return normalize_grid_guards(grid), confidence
 
 
+def _col_conflicts(
+    grid: list[list[str]],
+    scores: list[list[float]],
+    quality: float,
+    row: int,
+    start: int,
+    chars: str,
+) -> int:
+    """Count cells in a word's footprint that hold equal-or-higher-quality existing content."""
+    count = 0
+    for i in range(len(chars)):
+        c = start + i
+        if FIRST_DATA_COL <= c <= LAST_DATA_COL and grid[row][c] and scores[row][c] >= quality - 10:
+            count += 1
+    return count
+
+
 def place_word(
     grid: list[list[str]],
     scores: list[list[float]],
@@ -2033,13 +2071,30 @@ def place_word(
             int((word["top"] + word["height"] * 0.5 - geometry["origin_y"]) / cell_h),
         ),
     )
-    start_col = clamp_data_col(int(round((float(word["left"]) - geometry["origin_x"]) / cell_w)))
-
     compact = text.replace(" ", "")
     if not compact:
         return
 
     quality = word_quality(word)
+
+    # P2-F: snap start_col when the word's left edge is within 25% of a cell boundary
+    _raw = (float(word["left"]) - geometry["origin_x"]) / cell_w
+    _floor = int(_raw)
+    _frac = _raw - _floor
+    start_col = clamp_data_col(int(round(_raw)))
+    _BZ = 0.25
+    if _frac >= 1.0 - _BZ:
+        _alt = clamp_data_col(_floor)
+        if _col_conflicts(grid, scores, quality, row, _alt, compact) < \
+                _col_conflicts(grid, scores, quality, row, start_col, compact):
+            start_col = _alt
+    elif 0.0 < _frac <= _BZ:
+        _alt = clamp_data_col(_floor - 1)
+        if _alt >= FIRST_DATA_COL and \
+                _col_conflicts(grid, scores, quality, row, _alt, compact) < \
+                _col_conflicts(grid, scores, quality, row, start_col, compact):
+            start_col = _alt
+
     box_cols = max(1, int(round(float(word.get("width") or 1) / cell_w)))
     sequence = text if " " in text and len(text) <= box_cols + 2 else compact
     use_projected_spacing = " " not in sequence and box_cols > len(compact) + 1
@@ -3828,10 +3883,42 @@ def remember_templates(payload: dict[str, Any]) -> dict[str, Any]:
     return {"learned": learned, "characters": len(templates)}
 
 
+_ROW_POS_PENALTY_THRESHOLD = 0.5
+
+
+def score_candidate_row(
+    candidate: tuple,
+    row: int,
+    word_grid: list[list[str]],
+) -> float:
+    """Score a word-candidate for one row, weighting by source-word y-centre quality (P2-F)."""
+    _, candidate_grid, candidate_confidence, row_pos = candidate
+    text = row_string_from_cells(candidate_grid[row])
+    confidence_score = sum(candidate_confidence[row][FIRST_DATA_COL : LAST_DATA_COL + 1])
+    character_count = sum(
+        bool(cell) for cell in candidate_grid[row][FIRST_DATA_COL : LAST_DATA_COL + 1]
+    )
+    score = mcdu_row_score(text) + confidence_score * 2.0 + character_count * 0.5
+    # P2-F: penalise candidates whose source words are near a row boundary
+    pos_q = row_pos[row]
+    if pos_q < _ROW_POS_PENALTY_THRESHOLD:
+        score *= pos_q / _ROW_POS_PENALTY_THRESHOLD
+    # A1: penalize repeating the row just selected above; bonus digit content under label rows
+    if row > 0:
+        above_text = row_string_from_cells(word_grid[row - 1]).strip()
+        this_text = text.strip()
+        if above_text and this_text and above_text == this_text:
+            score -= 30.0
+        if above_text and any(w in above_text for w in MCDU_VOCABULARY if len(w) >= 3):
+            if re.search(r"\d", text):
+                score += 8.0
+    return score
+
+
 def deduplicate_adjacent_rows(
     word_grid: list[list[str]],
     word_confidence: list[list[float]],
-    word_candidates: list[tuple[str, list[list[str]], list[list[float]]]],
+    word_candidates: list[tuple],
     row_sources: list[str],
 ) -> None:
     """Replace rows that duplicate their neighbour above with the best non-duplicate candidate (A1).
@@ -3848,14 +3935,14 @@ def deduplicate_adjacent_rows(
         if not (above_text and this_text and above_text == this_text):
             continue
 
-        def _score(candidate: tuple[str, list[list[str]], list[list[float]]], _r: int = row) -> float:
-            _, cg, cc = candidate
+        def _score(candidate: tuple, _r: int = row) -> float:
+            _, cg, cc, *_ = candidate
             t = row_string_from_cells(cg[_r])
             return mcdu_row_score(t) + sum(cc[_r][FIRST_DATA_COL : LAST_DATA_COL + 1]) * 2.0
 
         ranked = sorted(word_candidates, key=_score, reverse=True)
         replaced = False
-        for cname, cg, cc in ranked:
+        for cname, cg, cc, *_ in ranked:
             if row_string_from_cells(cg[row]).strip() != above_text:
                 word_grid[row] = cg[row][:]
                 word_confidence[row] = cc[row][:]
@@ -3894,14 +3981,16 @@ def analyze(payload: dict[str, Any]) -> dict[str, Any]:
     # the user sees and edits in the browser.
     geometry = calibrate_grid([], screen_size)
 
-    word_candidates: list[tuple[str, list[list[str]], list[list[float]]]] = []
+    word_candidates: list[tuple[str, list[list[str]], list[list[float]], list[float]]] = []
     for _, variant_name, _, variant_words in ocr_candidates:
         candidate_grid = empty_grid()
         candidate_scores = [[0.0 for _ in range(COLS)] for _ in range(ROWS)]
         candidate_confidence = empty_confidence_grid()
         for word in variant_words:
             place_word(candidate_grid, candidate_scores, candidate_confidence, word, geometry)
-        word_candidates.append((variant_name, candidate_grid, candidate_confidence))
+        word_candidates.append(
+            (variant_name, candidate_grid, candidate_confidence, _row_pos_quality(variant_words, geometry))
+        )
 
     # #16: OCR coloured message boxes (blue/cyan/amber) without global inversion
     box_words = ocr_message_boxes(warped, geometry)
@@ -3911,11 +4000,11 @@ def analyze(payload: dict[str, Any]) -> dict[str, Any]:
         box_confidence = empty_confidence_grid()
         for word in box_words:
             place_word(box_grid, box_scores, box_confidence, word, geometry)
-        word_candidates.append(("message_box", box_grid, box_confidence))
+        word_candidates.append(("message_box", box_grid, box_confidence, [1.0] * ROWS))
 
     # C3: skip per-row strip if existing word candidates are already high-confidence
     _draft_conf = [[0.0] * COLS for _ in range(ROWS)]
-    for _, _cg, _cc in word_candidates:
+    for _, _cg, _cc, *_ in word_candidates:
         for _r in range(ROWS):
             for _c in range(FIRST_DATA_COL, LAST_DATA_COL + 1):
                 if _cg[_r][_c] and _cc[_r][_c] > _draft_conf[_r][_c]:
@@ -3940,7 +4029,7 @@ def analyze(payload: dict[str, Any]) -> dict[str, Any]:
     _t_box_strip = time.perf_counter() - _t1
 
     # #18: Per-row strip OCR — add to candidates (empty placeholder if C3 skip)
-    word_candidates.append(("per_row", strip_grid, strip_conf))
+    word_candidates.append(("per_row", strip_grid, strip_conf, [1.0] * ROWS))
     print(
         f"[ocr-timing] variants={len(_variants)}"
         f" tsv={_t_tsv:.2f}s"
@@ -3964,25 +4053,10 @@ def analyze(payload: dict[str, Any]) -> dict[str, Any]:
     word_confidence = empty_confidence_grid()
     row_sources: list[str] = []
     for row in range(ROWS):
-        def row_candidate_score(candidate: tuple[str, list[list[str]], list[list[float]]], _row: int = row) -> float:
-            _, candidate_grid, candidate_confidence = candidate
-            text = row_string_from_cells(candidate_grid[_row])
-            confidence_score = sum(candidate_confidence[_row][FIRST_DATA_COL : LAST_DATA_COL + 1])
-            character_count = sum(bool(cell) for cell in candidate_grid[_row][FIRST_DATA_COL : LAST_DATA_COL + 1])
-            score = mcdu_row_score(text) + confidence_score * 2.0 + character_count * 0.5
-            # A1: penalize repeating the row just selected above, and bonus digit
-            # content that logically follows a vocabulary label row.
-            if _row > 0:
-                above_text = row_string_from_cells(word_grid[_row - 1]).strip()
-                this_text = text.strip()
-                if above_text and this_text and above_text == this_text:
-                    score -= 30.0
-                if above_text and any(w in above_text for w in MCDU_VOCABULARY if len(w) >= 3):
-                    if re.search(r"\d", text):
-                        score += 8.0
-            return score
-
-        source_name, source_grid, source_confidence = max(word_candidates, key=row_candidate_score)
+        source_name, source_grid, source_confidence, *_ = max(
+            word_candidates,
+            key=lambda cand, _row=row: score_candidate_row(cand, _row, word_grid),
+        )
         word_grid[row] = source_grid[row][:]
         word_confidence[row] = source_confidence[row][:]
         row_sources.append(source_name)
