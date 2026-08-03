@@ -286,6 +286,35 @@ class OcrPassSelectionTests(unittest.TestCase):
         self.assertEqual(len(seen), 3, "Expected exactly three orientation passes (0, 90, 270)")
 
 
+class TesseractProcessTests(unittest.TestCase):
+    """analyze runs many tesseract processes at once; they must not fight or wedge."""
+
+    def test_omp_thread_limit_is_pinned(self) -> None:
+        """Without this each of ~8 concurrent processes starts its own OpenMP pool.
+
+        On a machine with few cores the oversubscription livelocks — it hung CI
+        until the runner killed eight orphaned tesseract processes.
+        """
+        self.assertEqual(app._tesseract_env().get("OMP_THREAD_LIMIT"), "1")
+
+    def test_every_tesseract_call_is_bounded(self) -> None:
+        """A wedged process must not be able to hang a request forever."""
+        source = Path(app.__file__).read_text(encoding="utf-8")
+        calls = re.findall(r"subprocess\.run\((?:[^()]|\([^()]*\))*\)", source, re.S)
+        self.assertGreaterEqual(len(calls), 4, "Expected to find the tesseract subprocess calls")
+        for call in calls:
+            self.assertIn("timeout=", call, f"Unbounded subprocess.run:\n{call}")
+            self.assertIn("env=_tesseract_env()", call, f"Missing pinned env:\n{call}")
+
+    def test_worker_count_tracks_cpu_count(self) -> None:
+        with patch.object(app.os, "cpu_count", return_value=2):
+            self.assertEqual(app._ocr_workers(8), 2, "Must not run 8 processes on 2 cores")
+        with patch.object(app.os, "cpu_count", return_value=16):
+            self.assertEqual(app._ocr_workers(8), 8, "Must not exceed the number of jobs")
+        with patch.object(app.os, "cpu_count", return_value=None):
+            self.assertGreaterEqual(app._ocr_workers(8), 1, "Unknown core count must still yield a worker")
+
+
 class ConfusableTokenRepairTests(unittest.TestCase):
     """Z/2, D/0, I/1 and S/5 confusions snapped onto MCDU vocabulary."""
 

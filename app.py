@@ -1548,6 +1548,38 @@ def _tesseract_extra_args() -> list[str]:
     return args
 
 
+def _tesseract_env() -> dict[str, str]:
+    """Environment for every tesseract subprocess.
+
+    OMP_THREAD_LIMIT=1 is essential, not a tuning knob. analyze runs up to eight
+    tesseract processes concurrently and each one otherwise starts its own
+    OpenMP pool sized to the whole machine. On a workstation that is merely
+    wasteful; on a two-core laptop the resulting oversubscription livelocks —
+    it hung CI until the runner killed eight orphaned tesseract processes.
+    Each process is single-threaded now, and the parallelism comes from the
+    pool above rather than from nested thread pools fighting each other.
+    """
+    env = dict(os.environ)
+    env["OMP_THREAD_LIMIT"] = "1"
+    return env
+
+
+# Per-call ceiling on a tesseract subprocess. A stuck process must not be able
+# to hang a request forever: OCR is supplemental everywhere it is used, so
+# dropping one pass is always better than never returning.
+TESSERACT_TIMEOUT_SECONDS = 120
+
+
+def _ocr_workers(job_count: int) -> int:
+    """How many tesseract processes to run at once.
+
+    Each is single-threaded (see _tesseract_env), so one per core is the right
+    shape. The old fixed ceiling of 8 meant a two-core office laptop started
+    eight processes for two cores and spent its time context-switching.
+    """
+    return max(1, min(job_count, os.cpu_count() or 4))
+
+
 def run_tesseract_tsv(image: Image.Image) -> list[dict[str, Any]]:
     with tempfile.TemporaryDirectory() as temp_dir:
         source = Path(temp_dir) / "screen.png"
@@ -1570,11 +1602,19 @@ def run_tesseract_tsv(image: Image.Image) -> list[dict[str, Any]]:
                 "tsv",
             ]
             try:
-                completed = subprocess.run(command, capture_output=True, text=True, check=False)
+                completed = subprocess.run(
+                    command, capture_output=True, text=True, check=False,
+                    timeout=TESSERACT_TIMEOUT_SECONDS, env=_tesseract_env(),
+                )
             except FileNotFoundError as exc:
                 raise RuntimeError(
                     "Tesseract OCR was not found. Install Tesseract OCR, or set TESSERACT_CMD to the full tesseract.exe path."
                 ) from exc
+            except subprocess.TimeoutExpired:
+                # Drop this PSM and keep the others; a wedged process must not
+                # take the whole request down with it.
+                last_error = f"tesseract psm {psm} timed out"
+                continue
             if completed.returncode != 0:
                 last_error = completed.stderr.strip()
             else:
@@ -1643,9 +1683,14 @@ def run_tesseract_boxes(image: Image.Image) -> list[dict[str, Any]]:
                 "makebox",
             ]
             try:
-                completed = subprocess.run(command, capture_output=True, text=True, check=False)
+                completed = subprocess.run(
+                    command, capture_output=True, text=True, check=False,
+                    timeout=TESSERACT_TIMEOUT_SECONDS, env=_tesseract_env(),
+                )
             except FileNotFoundError:
                 return []
+            except subprocess.TimeoutExpired:
+                continue
             if completed.returncode != 0:
                 continue
 
@@ -1718,7 +1763,7 @@ def _run_tesseract_single_line(image: Image.Image) -> list[dict[str, Any]]:
             "tsv",
         ]
         try:
-            completed = subprocess.run(command, capture_output=True, text=True, check=False, timeout=20)
+            completed = subprocess.run(command, capture_output=True, text=True, check=False, timeout=20, env=_tesseract_env())
         except (FileNotFoundError, subprocess.TimeoutExpired):
             return []
         if completed.returncode != 0:
@@ -1862,7 +1907,7 @@ def _ocr_confidence_score(image: Image.Image) -> float:
                 "tsv",
             ]
             completed = subprocess.run(
-                command, capture_output=True, text=True, check=False, timeout=12
+                command, capture_output=True, text=True, check=False, timeout=12, env=_tesseract_env()
             )
             if completed.returncode != 0:
                 return 0.0
@@ -4138,7 +4183,7 @@ def analyze(payload: dict[str, Any]) -> dict[str, Any]:
     fast_mode = bool(payload.get("fastMode", False))
     _variants = preprocessing_variants(warped, fast=fast_mode)
     _t0 = time.perf_counter()
-    with ThreadPoolExecutor(max_workers=min(len(_variants), 8)) as _pool:
+    with ThreadPoolExecutor(max_workers=_ocr_workers(len(_variants))) as _pool:
         _all_words = list(_pool.map(lambda vi: run_tesseract_tsv(vi[1]), _variants))
     _t_tsv = time.perf_counter() - _t0
     ocr_candidates: list[tuple[float, str, Image.Image, list[dict[str, Any]]]] = [
