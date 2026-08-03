@@ -2053,10 +2053,6 @@ def clamp_data_col(col: int) -> int:
     return max(FIRST_DATA_COL, min(LAST_DATA_COL, col))
 
 
-def nearest_data_col(x: float, cell_w: float) -> int:
-    return clamp_data_col(int(round(x / cell_w)))
-
-
 def normalize_grid_guards(grid: list[list[str]]) -> list[list[str]]:
     normalized = [[cell for cell in row[:COLS]] + [""] * max(0, COLS - len(row)) for row in grid[:ROWS]]
     for row in normalized:
@@ -2110,35 +2106,6 @@ def calibrate_grid(
         "cell_w": nominal_cell_w,
         "cell_h": nominal_cell_h,
     }
-
-
-def place_char(grid: list[list[str]], char_box: dict[str, Any], geometry: dict[str, float]) -> bool:
-    text = clean_ocr_text(str(char_box["text"]))[:1]
-    if not text:
-        return False
-
-    cell_w = geometry["cell_w"]
-    cell_h = geometry["cell_h"]
-    box_w = float(char_box.get("width") or 0)
-    box_h = float(char_box.get("height") or 0)
-    if box_w > cell_w * 2.15 or box_h > cell_h * 1.35 or box_w < 2 or box_h < 2:
-        return False
-
-    center_x = float(char_box["left"]) + box_w * 0.5
-    center_y = float(char_box["top"]) + box_h * 0.5
-    row = max(0, min(ROWS - 1, int((center_y - geometry["origin_y"]) / cell_h)))
-    col = clamp_data_col(int((center_x - geometry["origin_x"]) / cell_w))
-
-    if grid[row][col] and grid[row][col] != text:
-        for offset in (-1, 1, -2, 2):
-            next_col = col + offset
-            if FIRST_DATA_COL <= next_col <= LAST_DATA_COL and not grid[row][next_col]:
-                col = next_col
-                break
-    if not grid[row][col]:
-        grid[row][col] = text
-        return True
-    return False
 
 
 def build_character_grid(
@@ -2971,10 +2938,6 @@ def grid_row_text(grid: list[Any], row: int) -> str:
     return "".join(str(values[col])[:1] if col < len(values) and values[col] else " " for col in range(COLS))
 
 
-def normalize_requirement_value(value: str) -> str:
-    return re.sub(r"\s+", " ", clean_ocr_text(value)).strip().upper()
-
-
 def requirement_matches(requirement: dict[str, Any], observed: str) -> bool:
     expected = str(requirement.get("expected", ""))
     ignore_case = bool(requirement.get("ignoreCase", True))
@@ -3290,10 +3253,6 @@ def review_requirements(payload: dict[str, Any]) -> dict[str, Any]:
     return {"results": results, "summary": summary}
 
 
-def compact_row_text(value: str) -> str:
-    return re.sub(r"\s+", "", clean_ocr_text(value)).upper()
-
-
 def fixed_row_text(value: str) -> str:
     return value[:COLS].ljust(COLS)
 
@@ -3396,34 +3355,6 @@ def disambiguate_o_zero(grid: list[list[str]]) -> list[list[str]]:
             for offset, char in enumerate(normalized):
                 updated[row][start + offset] = char
     return normalize_grid_guards(updated)
-
-
-def grid_character_count(grid: list[list[str]]) -> int:
-    return sum(1 for row in grid for cell in row[FIRST_DATA_COL : LAST_DATA_COL + 1] if cell)
-
-
-def verify_grid_with_char_boxes(
-    word_grid: list[list[str]],
-    char_boxes: list[dict[str, Any]],
-    geometry: dict[str, float],
-) -> list[list[str]]:
-    verified = [[cell for cell in row] for row in word_grid]
-    char_grid = empty_grid()
-    for box in char_boxes:
-        place_char(char_grid, box, geometry)
-
-    for row in range(ROWS):
-        for col in range(FIRST_DATA_COL, LAST_DATA_COL + 1):
-            char_value = char_grid[row][col]
-            if not char_value or verified[row][col]:
-                continue
-            nearby_same = any(
-                verified[row][nearby] == char_value
-                for nearby in range(max(FIRST_DATA_COL, col - 2), min(LAST_DATA_COL, col + 2) + 1)
-            )
-            if nearby_same:
-                verified[row][col] = char_value
-    return normalize_grid_guards(verified)
 
 
 def recover_dash_lines(grid: list[list[str]], warped: Image.Image) -> list[list[str]]:
@@ -4466,27 +4397,6 @@ def export_docx(payload: dict[str, Any]) -> dict[str, str]:
     return {"url": f"/data/exports/{filename}", "filename": filename}
 
 
-def remember(payload: dict[str, Any]) -> dict[str, Any]:
-    original_raw = str(payload.get("original", ""))
-    corrected_raw = str(payload.get("corrected", ""))
-    row = int(payload.get("row", 0))
-    if not 0 <= row < ROWS:
-        raise ValueError("Correction row must be between 1 and 13.")
-
-    original = fixed_row_text(original_raw)
-    corrected_list = list(fixed_row_text(corrected_raw))
-    corrected_list[0] = " "
-    corrected_list[COLS - 1] = " "
-    corrected = "".join(corrected_list)
-    if original == corrected:
-        return {"count": len(load_corrections()), "skipped": True}
-
-    corrections = load_corrections()
-    corrections[correction_key(row, original)] = corrected
-    save_corrections(corrections)
-    return {"count": len(corrections)}
-
-
 def remember_grid(payload: dict[str, Any]) -> dict[str, Any]:
     source_grid = payload.get("sourceGrid")
     corrected_grid = payload.get("grid")
@@ -4563,8 +4473,6 @@ class McmduHandler(SimpleHTTPRequestHandler):
                 json_response(self, HTTPStatus.OK, flatten_display(payload))
             elif self.path == "/api/export-docx":
                 json_response(self, HTTPStatus.OK, export_docx(payload))
-            elif self.path == "/api/remember":
-                json_response(self, HTTPStatus.OK, remember(payload))
             elif self.path == "/api/remember-grid":
                 json_response(self, HTTPStatus.OK, remember_grid(payload))
             elif self.path == "/api/remember-templates":

@@ -45,7 +45,6 @@ Locate functions with `grep -n "def <name>" app.py` rather than trusting line nu
 - `/api/analyze` — runs OCR and returns a populated grid
 - `/api/refine-grid` — second OCR pass with re-focused crop
 - `/api/review-requirements` — validates specific cells against expected values
-- `/api/remember` — saves corrected cells as row-level corrections
 - `/api/remember-grid` — saves corrections from a complete grid
 - `/api/remember-templates` — learns character templates from changed cells
 - `/api/fuse-grids` — combines 2–3 grids from separate photos of the same page

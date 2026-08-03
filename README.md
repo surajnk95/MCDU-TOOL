@@ -168,3 +168,7 @@ data/exports/
 ```
 
 Each export is a `.docx` file containing the 13-row by 40-column MCDU grid.
+
+## Licence
+
+Released under the [MIT Licence](LICENSE) — colleagues are free to use, modify and redistribute the tool with attribution.
