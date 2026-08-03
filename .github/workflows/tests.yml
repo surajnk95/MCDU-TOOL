@@ -8,6 +8,10 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
+    # The suite runs in ~15s locally. A CI runner has fewer cores and the OCR
+    # tests spawn tesseract heavily, so allow headroom — but fail fast rather
+    # than letting a deadlock burn the default six-hour budget.
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
 

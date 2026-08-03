@@ -216,8 +216,10 @@ class OfflineGuaranteeTests(unittest.TestCase):
                 self.assertIn("disabled", app._PADDLE_ERROR.lower())
                 self.assertIsNone(app._PADDLE_OCR)
             finally:
+                # Leave _PADDLE_READY set. Clearing it makes the next
+                # get_paddle_ocr caller block for PADDLE_INIT_WAIT_SECONDS.
                 app._PADDLE_ERROR = ""
-                app._PADDLE_READY.clear()
+                app._PADDLE_READY.set()
 
     def test_hybrid_ocr_checkbox_is_unchecked_in_the_ui(self) -> None:
         html = (Path(app.__file__).parent / "static" / "index.html").read_text(encoding="utf-8")
@@ -340,15 +342,22 @@ class AtomicWriteTests(unittest.TestCase):
             replacement = original + "\nEXTRA"
             app.write_text_atomic(path, original)
 
-            observed: list[str] = []
+            # Collect into a set, and cap the sample count. An unbounded list on
+            # a hot spin loop grows without limit whenever the writer is slower
+            # than the reader — which is exactly what happens on a small CI
+            # runner, and it exhausts memory rather than failing the assertion.
+            observed: set[str] = set()
+            samples = 0
             stop = threading.Event()
 
             def reader() -> None:
-                while not stop.is_set():
+                nonlocal samples
+                while not stop.is_set() and samples < 20_000:
+                    samples += 1
                     try:
-                        observed.append(path.read_text(encoding="utf-8"))
+                        observed.add(path.read_text(encoding="utf-8"))
                     except OSError:
-                        observed.append("<missing>")
+                        observed.add("<missing>")
 
             thread = threading.Thread(target=reader, daemon=True)
             thread.start()
@@ -358,11 +367,11 @@ class AtomicWriteTests(unittest.TestCase):
                     app.write_text_atomic(path, original)
             finally:
                 stop.set()
-                thread.join(timeout=5)
+                thread.join(timeout=10)
 
         self.assertTrue(observed, "Reader thread never sampled the file")
         self.assertEqual(
-            set(observed) - {original, replacement},
+            observed - {original, replacement},
             set(),
             "Reader observed a partial or missing file during replacement",
         )
