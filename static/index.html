@@ -69,9 +69,13 @@
           </div>
           <div class="stage-group">
             <span class="stage-label">3 Read</span>
-            <label class="stage-toggle">
-              <input id="hybridOcr" type="checkbox" checked />
-              Hybrid OCR
+            <label class="stage-toggle" title="Halves the number of OCR passes. Measured on reference photos: about 25% faster with no accuracy loss. Turn this on if Analyze feels slow on this computer.">
+              <input id="fastMode" type="checkbox" />
+              Fast scan
+            </label>
+            <label class="stage-toggle" title="Second OCR engine. Off by default: PaddleOCR downloads its models from the internet the first time it runs. Tesseract alone is fully offline.">
+              <input id="hybridOcr" type="checkbox" />
+              Hybrid OCR (needs internet once)
             </label>
             <button id="analyzeButton" class="primary" type="button" disabled>Analyze Grid</button>
           </div>

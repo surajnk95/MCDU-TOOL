@@ -1,7 +1,9 @@
 import base64
+import inspect
 import io
 import math
 import os
+import re
 import tempfile
 import time
 import unittest
@@ -198,6 +200,201 @@ class PitchCorrectionTests(unittest.TestCase):
                                msg=f"Expected scale_y=1.0, got {scale_y}")
 
 
+class OfflineGuaranteeTests(unittest.TestCase):
+    """This tool must work on a locked-down machine with no network access."""
+
+    def test_paddle_is_disabled_unless_explicitly_enabled(self) -> None:
+        """PaddleOCR downloads model weights on first construction.
+
+        That is the only outbound connection the tool can make, so it must stay
+        off by default rather than being reached through a checked-by-default box.
+        """
+        with patch.object(app, "PADDLE_ENABLED", False), patch.object(app, "_PADDLE_OCR", None):
+            app._PADDLE_ERROR = ""
+            try:
+                app.initialize_paddle_ocr()
+                self.assertIn("disabled", app._PADDLE_ERROR.lower())
+                self.assertIsNone(app._PADDLE_OCR)
+            finally:
+                app._PADDLE_ERROR = ""
+                app._PADDLE_READY.clear()
+
+    def test_hybrid_ocr_checkbox_is_unchecked_in_the_ui(self) -> None:
+        html = (Path(app.__file__).parent / "static" / "index.html").read_text(encoding="utf-8")
+        match = re.search(r'<input id="hybridOcr"[^>]*>', html)
+        self.assertIsNotNone(match, "hybridOcr checkbox not found")
+        self.assertNotIn("checked", match.group(0), "Hybrid OCR must not default to on: it needs the network")
+
+    def test_no_outbound_network_calls_in_app(self) -> None:
+        source = Path(app.__file__).read_text(encoding="utf-8")
+        for banned in ("urllib.request", "urlopen", "import requests", "http.client", "socket.socket"):
+            self.assertNotIn(banned, source, f"{banned} would give the tool network access")
+
+
+class ImageSizeGuardTests(unittest.TestCase):
+    def test_oversized_photo_is_downscaled_before_processing(self) -> None:
+        """A 108 MP phone photo decodes to ~324 MB of RGB; analyze holds several copies."""
+        big = Image.new("RGB", (app.MAX_IMAGE_EDGE * 2, app.MAX_IMAGE_EDGE), "black")
+        buffer = io.BytesIO()
+        big.save(buffer, format="PNG")
+        data_url = "data:image/png;base64," + base64.b64encode(buffer.getvalue()).decode()
+
+        loaded = app.load_image(data_url)
+        self.assertEqual(max(loaded.size), app.MAX_IMAGE_EDGE)
+        self.assertAlmostEqual(loaded.width / loaded.height, 2.0, places=2, msg="Aspect ratio must be preserved")
+
+    def test_normal_photo_is_untouched(self) -> None:
+        img = Image.new("RGB", (1600, 1200), "black")
+        buffer = io.BytesIO()
+        img.save(buffer, format="PNG")
+        data_url = "data:image/png;base64," + base64.b64encode(buffer.getvalue()).decode()
+        self.assertEqual(app.load_image(data_url).size, (1600, 1200))
+
+
+class OcrPassSelectionTests(unittest.TestCase):
+    def test_row_strip_pass_is_off_by_default(self) -> None:
+        """PSM 7 invents characters inside empty entry boxes and wins rows with them.
+
+        Measured on the reference office photos, leaving it on cost 3.8 points of
+        row similarity. It stays available via {"rowStripOcr": true}.
+        """
+        source = inspect.getsource(app.analyze)
+        self.assertIn('payload.get("rowStripOcr", False)', source)
+        self.assertIn("not strip_requested", source)
+
+    def test_fast_mode_reduces_the_variant_set(self) -> None:
+        image = Image.new("RGB", (800, 650), "black")
+        full = app.preprocessing_variants(image)
+        fast = app.preprocessing_variants(image, fast=True)
+        self.assertLess(len(fast), len(full))
+        self.assertTrue({name for name, _ in fast}.issubset({name for name, _ in full}))
+        self.assertTrue({name for name, _ in fast}.issubset(app.FAST_VARIANTS))
+
+    def test_orientation_probe_does_not_score_the_unused_180(self) -> None:
+        """best_angle is chosen from 90 vs 270 and compared to 0, so 180 was a wasted pass."""
+        image = Image.new("RGB", (600, 450), "black")
+        seen: list[int] = []
+
+        def fake_score(candidate: Image.Image) -> float:
+            seen.append(candidate.size[0])
+            return 0.0
+
+        with patch.object(app, "_ocr_confidence_score", side_effect=fake_score):
+            app.probe_orientation(image)
+        self.assertEqual(len(seen), 3, "Expected exactly three orientation passes (0, 90, 270)")
+
+
+class ConfusableTokenRepairTests(unittest.TestCase):
+    """Z/2, D/0, I/1 and S/5 confusions snapped onto MCDU vocabulary."""
+
+    def test_known_words_are_recovered(self) -> None:
+        for broken, expected in (
+            ("CR2", "CRZ"), ("5PD", "SPD"), ("M0D", "MOD"),
+            ("5EL", "SEL"), ("1DENT", "IDENT"), ("0PT", "OPT"),
+        ):
+            self.assertEqual(app._repair_token(broken), expected, f"{broken} should snap to {expected}")
+
+    def test_numeric_values_are_never_rewritten(self) -> None:
+        """A wrong 'fix' to an altitude or speed is far worse than leaving OCR noise."""
+        for value in ("250", "12000", "16900", "2000A", ".687", "0100:00Z", "66.7%", "3.3", "FL204"):
+            self.assertEqual(app._repair_token(value), value, f"{value} must be left alone")
+
+    def test_ambiguous_tokens_are_left_for_the_user(self) -> None:
+        # "0" maps to both "O" and "D", so both candidates are reachable in one step.
+        with patch.object(app, "MCDU_VOCABULARY", {"XO", "XD"}):
+            self.assertEqual(app._repair_token("X0"), "X0", "Two candidates must not be guessed between")
+
+    def test_repair_preserves_token_width(self) -> None:
+        """Substitutions are written back into the same columns, so width must not change."""
+        grid = grid_with_row(" CR2 ALT")
+        repaired = app.repair_confusable_tokens(grid)
+        self.assertEqual(len(repaired[0]), app.COLS)
+        self.assertEqual("".join(c or " " for c in repaired[0]).strip(), "CRZ ALT")
+        for before, after in zip(grid[0], repaired[0]):
+            self.assertEqual(bool(before), bool(after), "Occupied cells must stay occupied")
+
+    def test_repair_runs_before_row_selection(self) -> None:
+        """A label bleeding into the row below arrives as 'CR2 ALT' over 'CRZ ALT'.
+
+        Those are different strings, so deduplicate_adjacent_rows cannot see the
+        repeat unless the confusion is normalised first.
+        """
+        source = inspect.getsource(app.analyze)
+        repair_at = source.index("repair_confusable_tokens(candidate_grid)")
+        select_at = source.index("deduplicate_adjacent_rows(word_grid")
+        self.assertLess(repair_at, select_at, "Repair must precede adjacent-row dedup")
+
+
+class AtomicWriteTests(unittest.TestCase):
+    def test_readers_never_observe_a_truncated_file(self) -> None:
+        """analyze fans OCR out across threads while tesseract reads the vocab files.
+
+        A plain write_text truncates before writing, so a concurrent reader can
+        see an empty file and lose the whole MCDU vocabulary for that pass.
+        """
+        import threading
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "vocab.txt"
+            original = "\n".join(sorted(app.MCDU_VOCABULARY))
+            replacement = original + "\nEXTRA"
+            app.write_text_atomic(path, original)
+
+            observed: list[str] = []
+            stop = threading.Event()
+
+            def reader() -> None:
+                while not stop.is_set():
+                    try:
+                        observed.append(path.read_text(encoding="utf-8"))
+                    except OSError:
+                        observed.append("<missing>")
+
+            thread = threading.Thread(target=reader, daemon=True)
+            thread.start()
+            try:
+                for _ in range(50):
+                    app.write_text_atomic(path, replacement)
+                    app.write_text_atomic(path, original)
+            finally:
+                stop.set()
+                thread.join(timeout=5)
+
+        self.assertTrue(observed, "Reader thread never sampled the file")
+        self.assertEqual(
+            set(observed) - {original, replacement},
+            set(),
+            "Reader observed a partial or missing file during replacement",
+        )
+
+    def test_identical_content_skips_the_write(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "vocab.txt"
+            app.write_text_atomic(path, "SAME")
+            before = path.stat().st_mtime_ns
+            time.sleep(0.01)
+            app.write_text_atomic(path, "SAME")
+            self.assertEqual(path.stat().st_mtime_ns, before, "Unchanged content must not rewrite")
+            self.assertEqual(path.read_text(encoding="utf-8"), "SAME")
+
+    def test_ensure_dirs_is_not_called_per_ocr_pass(self) -> None:
+        """ensure_dirs rewrites the vocab files and scans data/exports.
+
+        Both tesseract entry points run inside thread pools in analyze, so
+        calling it there reintroduces the truncation race and re-scans the
+        export directory once per OCR pass.
+        """
+        import inspect
+
+        for function in (app.run_tesseract_tsv, app.run_tesseract_boxes):
+            source = inspect.getsource(function)
+            self.assertNotIn(
+                "ensure_dirs()",
+                source,
+                f"{function.__name__} must not call ensure_dirs(); main() already does",
+            )
+
+
 class CorrectionSafetyTests(unittest.TestCase):
     def test_similar_dynamic_row_is_not_replaced(self) -> None:
         source = grid_with_row(" FL204  0458Z/ 60NM")
@@ -215,6 +412,63 @@ class CorrectionSafetyTests(unittest.TestCase):
         with patch.object(app, "load_corrections", return_value={key: app.grid_row_from_payload(corrected, 0)}):
             result = app.apply_corrections(source)
         self.assertEqual(app.grid_row_from_payload(result, 0), app.grid_row_from_payload(corrected, 0))
+
+    def test_second_correction_overwrites_rather_than_chains(self) -> None:
+        """Re-correcting a row must key on the raw OCR read, not the corrected text.
+
+        apply_corrections is a single pass, so a correction stored against an
+        already-corrected row (raw -> c1 -> c2) would leave c2 unreachable
+        forever. The frontend keys /api/remember-grid on rawGrid to prevent it.
+        """
+        raw = grid_with_row(" POS REE")
+        first = grid_with_row(" POS REF")
+        second = grid_with_row(" POS REF 1")
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with patch.object(app, "CORRECTIONS", Path(temp_dir) / "corrections.json"):
+                app.remember_grid({"sourceGrid": raw, "grid": first})
+                # Second pass keys on the same raw grid, exactly as the UI now does.
+                app.remember_grid({"sourceGrid": raw, "grid": second})
+
+                stored = app.load_corrections()
+                self.assertEqual(
+                    len(stored), 1, "Re-correcting one row must not leave a stale chained entry"
+                )
+                result = app.apply_corrections(raw)
+
+        self.assertEqual(
+            app.grid_row_from_payload(result, 0),
+            app.grid_row_from_payload(second, 0),
+            "A fresh analyze of the same photo must yield the latest correction",
+        )
+
+
+class FrontendCorrectionContractTests(unittest.TestCase):
+    """Static guards on static/app.js — there is no JS test runner in this project."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.source = (Path(app.__file__).parent / "static" / "app.js").read_text(encoding="utf-8")
+
+    def test_row_corrections_are_keyed_on_the_raw_grid(self) -> None:
+        self.assertIn(
+            "sourceGrid: state.rawGrid",
+            self.source,
+            "/api/remember-grid must key on the pre-corrections grid, or a second "
+            "correction to a row is stored under the first correction's text and "
+            "apply_corrections (single pass) can never reach it",
+        )
+
+    def test_template_learning_is_keyed_on_the_displayed_grid(self) -> None:
+        self.assertIn(
+            "sourceGrid: state.sourceGrid",
+            self.source,
+            "/api/remember-templates must diff against what was displayed, so only "
+            "cells the user actually retyped contribute samples",
+        )
+
+    def test_analyze_populates_the_raw_grid(self) -> None:
+        self.assertIn("state.rawGrid = normalizeGridGuards(result.rawGrid", self.source)
 
 
 class OcrMergeTests(unittest.TestCase):
@@ -381,6 +635,7 @@ class TemplateLearningTests(unittest.TestCase):
                 patch.object(app, "TEMPLATES", template_path),
                 patch.object(app, "load_image"),
                 patch.object(app, "warp_screen"),
+                patch.object(app, "clean_warped_image", side_effect=lambda image: image),
                 patch.object(app, "cell_feature", return_value=[1.0]),
                 patch.object(app, "load_templates", return_value={}),
                 patch.object(app, "save_templates") as save,
@@ -403,6 +658,7 @@ class TemplateLearningTests(unittest.TestCase):
         with (
             patch.object(app, "load_image"),
             patch.object(app, "warp_screen"),
+            patch.object(app, "clean_warped_image", side_effect=lambda image: image),
             patch.object(app, "cell_feature", return_value=[1.0]),
             patch.object(app, "load_templates", return_value={}),
             patch.object(app, "save_templates") as save,
@@ -412,6 +668,36 @@ class TemplateLearningTests(unittest.TestCase):
             )
         self.assertEqual(result["learned"], 1)
         self.assertEqual(set(save.call_args.args[0]), {app.BLANK_TEMPLATE_KEY})
+
+    def test_templates_are_learned_from_the_cleaned_warp(self) -> None:
+        """Learning must run on the same cleaned image apply_templates classifies against.
+
+        Learning on the raw warp bakes the magenta cursor, glare and entry
+        outlines into the stored feature vectors, so the cells a user corrects
+        most are exactly the ones that can never re-match at inference time.
+        """
+        source = grid_with_row(" ABC")
+        corrected = grid_with_row(" ADC")
+        warped = app.Image.new("RGB", (1600, 1300), "black")
+        cleaned = app.Image.new("RGB", (1600, 1300), "black")
+        seen: list[app.Image.Image] = []
+
+        with (
+            patch.object(app, "load_image"),
+            patch.object(app, "warp_screen", return_value=warped),
+            patch.object(app, "clean_warped_image", return_value=cleaned) as clean,
+            patch.object(app, "cell_feature", side_effect=lambda image, r, c: seen.append(image) or [1.0]),
+            patch.object(app, "load_templates", return_value={}),
+            patch.object(app, "save_templates"),
+        ):
+            app.remember_templates(
+                {"image": "unused", "corners": [{}, {}, {}, {}], "sourceGrid": source, "grid": corrected}
+            )
+
+        clean.assert_called_once_with(warped)
+        self.assertTrue(seen, "Expected at least one cell to be sampled")
+        for image in seen:
+            self.assertIs(image, cleaned, "Templates must be sampled from the cleaned warp")
 
     def test_blank_template_removes_only_a_predicted_dash(self) -> None:
         grid = app.empty_grid()

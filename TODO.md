@@ -19,16 +19,20 @@ and **multiple MCDU screens in one photo**).
 
 ## Key reference points in `app.py`
 
+Find these with `grep -n "def <name>" app.py`. Line numbers are deliberately not
+recorded here — they went stale by ~1,800 lines the last time they were.
+
 | Area | Function(s) |
 | --- | --- |
-| Image load | `load_image` (~205) |
-| Display detection | `detect_display` (~1557), `refine_display_corners` (~1372), `component_corners` (~1469), `connected_components` (~1238) |
-| Warp / grid align | `warp_screen` (~352), `align_warp_to_grid` (~323), `estimate_grid_origin` (~275), `calibrate_grid` (~991) |
-| Preprocessing | `preprocess_for_ocr` (~357), `preprocessing_variants` (~365) |
-| Tesseract | `run_tesseract_tsv` (~742), `run_tesseract_boxes` (~808) |
-| Templates | `cell_feature` (~374), `feature_distance` (~393), `classify_from_templates` (~424), `apply_templates` (~1994) |
-| Post-processing | `clean_ocr_text` (~883), `normalize_mcdu_phrase` (~892), `disambiguate_o_zero` (~2060), `recover_dash_lines` (~2107) |
-| Orchestration | `analyze` (~2252), `refine_grid` (~2357) |
+| Image load | `load_image` |
+| Display detection | `detect_display`, `refine_display_corners`, `component_corners`, `connected_components` |
+| Warp / grid align | `warp_screen`, `align_warp_to_grid`, `estimate_grid_origin`, `calibrate_grid` |
+| Preprocessing | `preprocess_for_ocr`, `preprocessing_variants`, `clean_warped_image` |
+| Tesseract | `run_tesseract_tsv`, `run_tesseract_boxes`, `per_row_strip_ocr` |
+| Templates | `cell_feature`, `feature_distance`, `classify_from_templates`, `apply_templates`, `remember_templates` |
+| Post-processing | `clean_ocr_text`, `normalize_mcdu_phrase`, `disambiguate_o_zero`, `recover_dash_lines`, `validate_field_formats` |
+| Orchestration | `analyze`, `refine_grid`, `fuse_engine_grids` |
+| Persistence | `write_text_atomic`, `apply_corrections`, `load_corrections`, `save_templates` |
 | Constants | `MCDU_VOCABULARY`, `MCDU_WORD_HINTS`, `OCR_WHITELIST`, `ROWS`, `COLS` |
 
 ---

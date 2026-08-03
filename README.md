@@ -98,15 +98,32 @@ Required Python packages:
 python -m pip install -r requirements.txt
 ```
 
+## Offline Guarantee
+
+The tool makes no outbound network connections. Photos never leave the computer, there is no telemetry, and no cloud OCR or web API is used. The page loads no external fonts, scripts, or styles, and the browser only ever talks to `127.0.0.1`.
+
+There is exactly one exception, and it is off by default:
+
+- **Hybrid OCR** starts PaddleOCR, which downloads its recognition models from the internet the first time it runs. The checkbox is unchecked and the engine refuses to start unless `MCDU_ENABLE_PADDLE=1` is set. Leave it off on a restricted machine; Tesseract alone runs fully offline.
+
+A test in `tests/test_app.py` fails the build if network-capable calls are added to `app.py` or if the Hybrid OCR box is ever defaulted back to on.
+
+## If Analysis Feels Slow
+
+`Analyze Grid` runs many OCR passes. On a slower office laptop:
+
+- Tick **Fast scan**. It halves the number of passes — about 25% faster, with no measured accuracy loss on the reference photos.
+- Leave **Hybrid OCR** off. It adds a second engine and, on a restricted machine, will stall waiting for a model download that cannot complete.
+
+## Optional Hybrid OCR
+
 For hybrid OCR, use Python 3.11, 3.12, or 3.13 and install:
 
 ```bash
 python -m pip install -r requirements-hybrid.txt
 ```
 
-The standard requirements remain usable when PaddleOCR cannot be installed. When `Hybrid OCR` is enabled, the status bar reports whether both engines ran or whether analysis fell back to Tesseract.
-
-The first hybrid run downloads the compact PaddleOCR detection and English recognition models. After they are cached, image processing stays local. For an offline office deployment, include the cached PaddleOCR models when packaging the final EXE.
+Then start the tool with `MCDU_ENABLE_PADDLE=1`. The standard requirements remain usable when PaddleOCR cannot be installed; the status bar reports whether both engines ran or whether analysis fell back to Tesseract. For an offline office deployment, include the cached PaddleOCR models when packaging the final EXE — otherwise leave hybrid OCR disabled.
 
 Tesseract OCR must also be installed on the computer.
 

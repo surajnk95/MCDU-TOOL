@@ -23,6 +23,7 @@ const verificationMode = document.querySelector("#verificationMode");
 const refineGridButton = document.querySelector("#refineGridButton");
 const verificationSummary = document.querySelector("#verificationSummary");
 const hybridOcr = document.querySelector("#hybridOcr");
+const fastMode = document.querySelector("#fastMode");
 const requirementRow = document.querySelector("#requirementRow");
 const requirementStart = document.querySelector("#requirementStart");
 const requirementEnd = document.querySelector("#requirementEnd");
@@ -65,7 +66,12 @@ const state = {
   selectedCandidateIndex: -1,
   dragging: -1,
   viewMode: "photo",
+  // sourceGrid = what is currently rendered (baseline for template learning:
+  // only cells the user retypes count). rawGrid = the pre-corrections OCR read
+  // from the last analyze, which row corrections must be keyed against so a
+  // second correction overwrites the first instead of chaining off it.
   sourceGrid: makeEmptyGrid(),
+  rawGrid: makeEmptyGrid(),
   confidenceGrid: Array.from({ length: ROWS }, () => Array.from({ length: COLS }, () => 0)),
   colorGrid: Array.from({ length: ROWS }, () => Array.from({ length: COLS }, () => "")),
   requirements: [],
@@ -790,6 +796,8 @@ fileInput.addEventListener("change", () => {
       state.selectedCandidateIndex = -1;
       state.confidenceGrid = Array.from({ length: ROWS }, () => Array.from({ length: COLS }, () => 0));
       state.colorGrid = makeEmptyColorGrid();
+      state.sourceGrid = makeEmptyGrid();
+      state.rawGrid = makeEmptyGrid();
       blurBanner.hidden = true;
       addToFusionButton.disabled = true;
       setViewMode("photo");
@@ -938,8 +946,10 @@ analyzeButton.addEventListener("click", async () => {
         mode: verificationMode.value,
       },
       hybridOcr: hybridOcr.checked,
+      fastMode: fastMode.checked,
     });
     state.sourceGrid = normalizeGridGuards(result.grid);
+    state.rawGrid = normalizeGridGuards(result.rawGrid || result.grid);
     state.confidenceGrid = result.confidenceGrid || Array.from({ length: ROWS }, () => Array.from({ length: COLS }, () => 0));
     state.colorGrid = result.colorGrid || makeEmptyColorGrid();
     blurBanner.hidden = !result.blurry;
@@ -1022,27 +1032,30 @@ exportButton.addEventListener("click", async () => {
 
 rememberButton.addEventListener("click", async () => {
   const current = getCurrentGrid();
-  const changes = [];
+  let changed = 0;
   for (let row = 0; row < ROWS; row += 1) {
-    const original = gridRowText(state.sourceGrid[row] || []);
+    const original = gridRowText(state.rawGrid[row] || []);
     const corrected = gridRowText(current[row] || []);
     if (corrected.trim() && original !== corrected) {
-      changes.push({ row, original, corrected });
+      changed += 1;
     }
   }
 
   rememberButton.disabled = true;
-  setStatus(`Remembering ${changes.length} correction rows`);
+  setStatus(`Remembering ${changed} correction rows`);
   try {
-    const sourceGrid = state.sourceGrid;
+    // Row corrections key on the raw OCR read, so correcting the same row twice
+    // overwrites the first entry rather than storing an unreachable chain.
     await postJson("/api/remember-grid", {
-      sourceGrid,
+      sourceGrid: state.rawGrid,
       grid: current,
     });
+    // Template learning keys on what was displayed, so only cells the user
+    // actually retyped contribute samples.
     const learned = await postJson("/api/remember-templates", {
       image: state.imageDataUrl,
       corners: getGridCorners(),
-      sourceGrid,
+      sourceGrid: state.sourceGrid,
       grid: current,
     });
     state.sourceGrid = current;
@@ -1269,7 +1282,11 @@ fuseButton.addEventListener("click", async () => {
       grids: state.fusionSlots.map((s) => s.grid),
     });
     const fused = normalizeGridGuards(result.grid);
+    // A fused grid has no single raw OCR read behind it, so it becomes its own
+    // correction key — carrying over the last photo's rawGrid would store the
+    // fused edits against an unrelated row.
     state.sourceGrid = fused;
+    state.rawGrid = fused;
     state.confidenceGrid = Array.from({ length: ROWS }, () => Array.from({ length: COLS }, () => 0));
     state.colorGrid = makeEmptyColorGrid();
     renderGridTable(fused, state.confidenceGrid, state.colorGrid);

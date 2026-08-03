@@ -232,6 +232,13 @@ class SyntheticRegressionTests(unittest.TestCase):
             f"Clean-render accuracy {acc:.1%} ({correct}/{total}) is below the 90% threshold",
         )
 
+        # The UI keys row corrections on rawGrid (pre-apply_corrections) so a
+        # second correction to a row overwrites the first instead of chaining
+        # off it into an entry apply_corrections can never reach.
+        self.assertIn("rawGrid", result, "analyze must expose the pre-corrections grid")
+        self.assertEqual(len(result["rawGrid"]), app.ROWS)
+        self.assertEqual(len(result["rawGrid"][0]), app.COLS)
+
     # ------------------------------------------------------------------
     # Test 2 — Blurred + perspective-warped render
     # ------------------------------------------------------------------

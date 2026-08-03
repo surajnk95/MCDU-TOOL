@@ -12,6 +12,7 @@ import subprocess
 import tempfile
 import threading
 import time
+import traceback
 from concurrent.futures import ThreadPoolExecutor
 import uuid
 from http import HTTPStatus
@@ -97,12 +98,26 @@ _ATLAS_THRESHOLD: float = 0.55   # minimum NCC score to accept a classification
 _ATLAS_MARGIN: float = 0.08      # minimum gap between 1st and 2nd-best scores
 _ATLAS_MAX_CONFIDENCE: float = 0.55  # cap on confidence written into grid
 MAX_REQUEST_BYTES = 50 * 1024 * 1024
+# Longest edge kept after decoding. 4000 px still oversamples the 1600 px warp
+# target by 2.5x on a full-frame MCDU photo, so detection and OCR are unaffected.
+MAX_IMAGE_EDGE = 4000
+# Hard ceiling on decoded pixels, checked before PIL allocates. Photos are user
+# chosen and local, so this is an out-of-memory guard rather than a security one.
+Image.MAX_IMAGE_PIXELS = 200_000_000
 MAX_EXPORT_FILES = 80
 BLUR_THRESHOLD = 80.0         # variance-of-Laplacian below this → blurry warning (#25)
 BLUR_WARNING_THRESHOLD = 150.0  # between BLUR_THRESHOLD and this → marginal quality (#D3)
 _TSV_EARLY_WINNER_SCORE = 55.0  # C2: stop extra PSMs when a variant already scores this well
 _TSV_GIVEUP_SCORE = 5.0         # C2: give up on a variant after 2 PSMs if score this poor
 _STRIP_SKIP_CONFIDENCE = 0.72   # C3: skip per-row strip when mean filled-cell confidence >= this
+# Fast-mode variant subset. Chosen by measuring outright row wins across the
+# reference office photos: adaptive 13, contrast 12, denoised 11, unsharp 11 —
+# together 47 of 65 rows. Halves the Tesseract passes at some accuracy cost.
+FAST_VARIANTS = frozenset({"adaptive", "contrast", "denoised", "unsharp"})
+# per_row strip OCR is a supplemental signal (single-line PSM 7). It reads a
+# blank entry box as invented characters, and that inflated character count can
+# out-score a better whole-image read, so it must win by a margin, not a point.
+_PER_ROW_SCORE_WEIGHT = 0.9
 EXPORT_MAX_AGE_SECONDS = 7 * 24 * 60 * 60
 MCDU_WORD_HINTS = {
     "ACT",
@@ -173,6 +188,51 @@ MCDU_VOCABULARY = {
     "STEP",
     "TO",
     "TRUE",
+    # Observed on the reference office photos (CRZ, DES, RTA PROGRESS and RTA
+    # LIMITS pages). These feed three things: the Tesseract user-words file,
+    # mcdu_row_score candidate ranking, and repair_confusable_tokens below.
+    "BEST",
+    "CLB",
+    "DTG",
+    "EARLIEST",
+    "ERASE",
+    "ERROR",
+    "ETA",
+    "FIX",
+    "FORECAST",
+    "FPA",
+    "HOLD",
+    "LATEST",
+    "LIMITS",
+    "MIN",
+    "MOD",
+    "PROGRESS",
+    "RESTR",
+    "RVSM",
+    "SEC",
+    "THRESHOLD",
+    "TIME",
+    "VECTORS",
+    "WINDOW",
+    "WPT",
+}
+# Same-length character confusions Tesseract makes on the MCDU font. Used only
+# to snap a token onto a known vocabulary word — never to rewrite free numbers.
+OCR_CONFUSIONS: dict[str, tuple[str, ...]] = {
+    "0": ("O", "D"),
+    "1": ("I", "L", "T"),
+    "2": ("Z",),
+    "4": ("A",),
+    "5": ("S",),
+    "6": ("G",),
+    "8": ("B",),
+    "O": ("0", "D"),
+    "I": ("1",),
+    "Z": ("2",),
+    "S": ("5",),
+    "B": ("8",),
+    "G": ("6",),
+    "D": ("0", "O"),
 }
 MCDU_PHRASE_REPLACEMENTS = (
     ("ACTRTACRZ", "ACT RTA CRZ"),
@@ -241,20 +301,48 @@ def find_tesseract() -> str:
 TESSERACT = find_tesseract()
 _PADDLE_OCR: Any | None = None
 _PADDLE_ERROR = ""
+# OFFLINE GUARD. Constructing PaddleOCR downloads model weights over the network
+# on first use — the only outbound connection this tool is capable of making.
+# It stays off unless explicitly enabled, so a default install is fully offline.
+PADDLE_ENABLED = os.environ.get("MCDU_ENABLE_PADDLE", "").strip().lower() in {"1", "true", "yes"}
 _PADDLE_LOCK = threading.Lock()
 _PADDLE_READY = threading.Event()
 _PADDLE_INITIALIZING = False
+
+
+def write_text_atomic(path: Path, content: str) -> None:
+    """Replace *path* with *content* in one step, leaving no truncated window.
+
+    Tesseract subprocesses read the vocabulary files while other threads may be
+    refreshing them; a plain write_text truncates first, so a concurrent reader
+    can see an empty file. Writing a sibling temp file and os.replace-ing it is
+    atomic on POSIX and Windows, so a reader sees either the old or new content.
+    Skips the write entirely when the content is already correct.
+    """
+    try:
+        if path.exists() and path.read_text(encoding="utf-8") == content:
+            return
+    except OSError:
+        pass
+    handle, temp_name = tempfile.mkstemp(dir=str(path.parent), suffix=".tmp")
+    try:
+        with os.fdopen(handle, "w", encoding="utf-8") as stream:
+            stream.write(content)
+        os.replace(temp_name, path)
+    except BaseException:
+        Path(temp_name).unlink(missing_ok=True)
+        raise
 
 
 def ensure_dirs() -> None:
     DATA.mkdir(exist_ok=True)
     EXPORTS.mkdir(exist_ok=True)
     if not CORRECTIONS.exists():
-        CORRECTIONS.write_text("{}", encoding="utf-8")
+        write_text_atomic(CORRECTIONS, "{}")
     if not TEMPLATES.exists():
-        TEMPLATES.write_text("{}", encoding="utf-8")
-    VOCAB_WORDS.write_text("\n".join(sorted(MCDU_VOCABULARY)), encoding="utf-8")
-    VOCAB_PATTERNS.write_text("\n".join(MCDU_TESSERACT_PATTERNS), encoding="utf-8")
+        write_text_atomic(TEMPLATES, "{}")
+    write_text_atomic(VOCAB_WORDS, "\n".join(sorted(MCDU_VOCABULARY)))
+    write_text_atomic(VOCAB_PATTERNS, "\n".join(MCDU_TESSERACT_PATTERNS))
     cleanup_exports()
 
 
@@ -296,10 +384,26 @@ def read_json_body(handler: SimpleHTTPRequestHandler) -> dict[str, Any]:
 
 
 def load_image(data_url: str) -> Image.Image:
+    """Decode a data URL, correct EXIF rotation, and bound the working size.
+
+    A current phone shoots 48-108 MP. Decoded to RGB that is 150-320 MB, and
+    analyze holds the original plus the warp plus five preprocessing variants
+    plus thirteen row strips across eight threads — enough to exhaust an office
+    laptop even though the JPEG easily passed MAX_REQUEST_BYTES. Nothing is
+    lost by shrinking first: the warp target is SCREEN_W (1600 px) wide.
+    """
     if "," in data_url:
         data_url = data_url.split(",", 1)[1]
     raw = base64.b64decode(data_url)
-    return ImageOps.exif_transpose(Image.open(io.BytesIO(raw))).convert("RGB")
+    image = ImageOps.exif_transpose(Image.open(io.BytesIO(raw))).convert("RGB")
+    longest = max(image.size)
+    if longest > MAX_IMAGE_EDGE:
+        ratio = MAX_IMAGE_EDGE / longest
+        image = image.resize(
+            (max(1, round(image.width * ratio)), max(1, round(image.height * ratio))),
+            Image.Resampling.LANCZOS,
+        )
+    return image
 
 
 def edge_length(a: dict[str, float], b: dict[str, float]) -> float:
@@ -514,7 +618,14 @@ def preprocess_for_ocr(image: Image.Image) -> Image.Image:
     return gray
 
 
-def preprocessing_variants(image: Image.Image) -> list[tuple[str, Image.Image]]:
+def preprocessing_variants(image: Image.Image, fast: bool = False) -> list[tuple[str, Image.Image]]:
+    """Build the preprocessing variants Tesseract is run against.
+
+    Every variant earns its keep — measured across the reference office photos,
+    all eight win at least two rows outright — so the full set is the default.
+    ``fast=True`` keeps only FAST_VARIANTS, roughly halving the Tesseract passes
+    for users on a slow machine who would rather trade some accuracy for speed.
+    """
     gray = max_channel_gray(image)
     variants: list[tuple[str, Image.Image]] = [
         ("contrast", preprocess_for_ocr(image)),
@@ -557,6 +668,10 @@ def preprocessing_variants(image: Image.Image) -> list[tuple[str, Image.Image]]:
     except ImportError:
         pass  # OpenCV absent — the three pure-PIL variants above are still returned
 
+    if fast:
+        selected = [pair for pair in variants if pair[0] in FAST_VARIANTS]
+        if selected:
+            return selected
     return variants
 
 
@@ -913,7 +1028,7 @@ def load_templates() -> dict[str, list[list[float]]]:
 def save_templates(templates: dict[str, list[list[float]]]) -> None:
     ensure_dirs()
     compact = {char: features[-30:] for char, features in templates.items() if features}
-    TEMPLATES.write_text(json.dumps(compact), encoding="utf-8")
+    write_text_atomic(TEMPLATES, json.dumps(compact))
 
 
 # ─── Glyph Atlas — B1 ───────────────────────────────────────────────────────
@@ -1137,6 +1252,13 @@ def ocr_words_score(words: list[dict[str, Any]], image_height: int) -> float:
 def initialize_paddle_ocr() -> None:
     global _PADDLE_OCR, _PADDLE_ERROR
     try:
+        if not PADDLE_ENABLED:
+            _PADDLE_ERROR = (
+                "PaddleOCR is disabled. It downloads recognition models from the "
+                "internet the first time it starts, so it stays off unless "
+                "MCDU_ENABLE_PADDLE=1 is set. Tesseract runs fully offline."
+            )
+            return
         try:
             from paddleocr import PaddleOCR
         except (ImportError, OSError) as exc:
@@ -1427,7 +1549,6 @@ def _tesseract_extra_args() -> list[str]:
 
 
 def run_tesseract_tsv(image: Image.Image) -> list[dict[str, Any]]:
-    ensure_dirs()
     with tempfile.TemporaryDirectory() as temp_dir:
         source = Path(temp_dir) / "screen.png"
         image.save(source)
@@ -1502,7 +1623,6 @@ def run_tesseract_tsv(image: Image.Image) -> list[dict[str, Any]]:
 
 
 def run_tesseract_boxes(image: Image.Image) -> list[dict[str, Any]]:
-    ensure_dirs()
     width, height = image.size
     with tempfile.TemporaryDirectory() as temp_dir:
         source = Path(temp_dir) / "screen.png"
@@ -1778,10 +1898,22 @@ def probe_orientation(image: Image.Image) -> int:
         (max(1, round(image.width * scale)), max(1, round(image.height * scale))),
         Image.Resampling.LANCZOS,
     )
-    scores: dict[int, float] = {}
-    for angle in (0, 90, 180, 270):
-        candidate = small.rotate(angle, expand=True) if angle else small
-        scores[angle] = _ocr_confidence_score(preprocess_for_ocr(candidate))
+    # Only 0/90/270 are scored. 180 was previously measured and then discarded
+    # unread — best_angle is picked from 90 vs 270 and compared against 0 — so
+    # it cost a full Tesseract pass per auto-detect for nothing.
+    # The three remaining passes are independent, so run them concurrently:
+    # detection is interactive and this is its dominant cost.
+    angles = (0, 90, 270)
+    with ThreadPoolExecutor(max_workers=len(angles)) as pool:
+        measured = list(
+            pool.map(
+                lambda angle: _ocr_confidence_score(
+                    preprocess_for_ocr(small.rotate(angle, expand=True) if angle else small)
+                ),
+                angles,
+            )
+        )
+    scores: dict[int, float] = dict(zip(angles, measured))
 
     upright = scores[0]
     best_angle = 90 if scores[90] >= scores[270] else 270
@@ -2318,6 +2450,48 @@ def fuse_atlas_grid(
 
 
 def connected_components(mask: np.ndarray) -> list[dict[str, Any]]:
+    """Label the True regions of *mask*, largest-component metadata included.
+
+    Uses OpenCV when available: the pure-Python flood fill below walks every
+    dark pixel through an interpreter-level stack, which on a dim office photo
+    (where most of the frame is below the darkness threshold) is the single
+    slowest step in display detection. cv2 does the same work in C++.
+    """
+    try:
+        import cv2
+    except ImportError:
+        return _connected_components_python(mask)
+
+    count_labels, labels, stats, _ = cv2.connectedComponentsWithStats(
+        mask.astype(np.uint8), connectivity=4
+    )
+    components: list[dict[str, Any]] = []
+    for label in range(1, count_labels):
+        count = int(stats[label, cv2.CC_STAT_AREA])
+        if count < 250:
+            continue
+        x1 = int(stats[label, cv2.CC_STAT_LEFT])
+        y1 = int(stats[label, cv2.CC_STAT_TOP])
+        x2 = x1 + int(stats[label, cv2.CC_STAT_WIDTH])
+        y2 = y1 + int(stats[label, cv2.CC_STAT_HEIGHT])
+        ys, xs = np.nonzero(labels == label)
+        components.append(
+            {
+                "count": count,
+                "x1": x1,
+                "y1": y1,
+                "x2": x2,
+                "y2": y2,
+                "fill": count / max(1, (x2 - x1) * (y2 - y1)),
+                "xs": xs.tolist(),
+                "ys": ys.tolist(),
+            }
+        )
+    return components
+
+
+def _connected_components_python(mask: np.ndarray) -> list[dict[str, Any]]:
+    """Pure-numpy fallback used only when OpenCV is missing."""
     height, width = mask.shape
     seen = np.zeros(mask.shape, dtype=bool)
     components: list[dict[str, Any]] = []
@@ -2789,7 +2963,7 @@ def load_corrections() -> dict[str, str]:
 
 def save_corrections(corrections: dict[str, str]) -> None:
     ensure_dirs()
-    CORRECTIONS.write_text(json.dumps(corrections, indent=2, sort_keys=True), encoding="utf-8")
+    write_text_atomic(CORRECTIONS, json.dumps(corrections, indent=2, sort_keys=True))
 
 
 def grid_row_text(grid: list[Any], row: int) -> str:
@@ -3026,7 +3200,11 @@ def review_requirements(payload: dict[str, Any]) -> dict[str, Any]:
     image_data = str(payload.get("image", ""))
     corners = payload.get("corners")
     if image_data and isinstance(corners, list) and len(corners) == 4:
-        warped = warp_screen(load_image(image_data), corners)
+        # Cleaned warp, matching analyze/refine_grid: focused_grid_read below
+        # compares its OCR against a grid produced from the cleaned image, so
+        # rechecking the raw warp would fail requirements sitting under the
+        # cursor or a glare patch for reasons unrelated to their value.
+        warped = clean_warped_image(warp_screen(load_image(image_data), corners))
 
     results: list[dict[str, Any]] = []
     for index, raw_requirement in enumerate(requirements, 1):
@@ -3740,6 +3918,60 @@ def detect_title_chip_text(
     return results
 
 
+def repair_confusable_tokens(grid: list[list[str]]) -> list[list[str]]:
+    """Snap tokens onto MCDU vocabulary across a single OCR character confusion.
+
+    Tesseract reliably confuses a handful of glyph pairs in this font — Z/2,
+    D/0, I/1, S/5 — which turns ``CRZ ALT`` into ``CR2 ALT`` and ``E/D`` into
+    ``E/0``. Each substitution is the same width, so the repair is written back
+    into the same grid columns and cannot shift the layout.
+
+    Deliberately conservative, because a wrong "fix" to a real value is worse
+    than leaving OCR noise on screen for the user to correct:
+
+    * a token already in the vocabulary is left alone;
+    * a token with no letters is left alone, so altitudes, speeds and flight
+      levels (``250``, ``12000``, ``16900``) are never rewritten;
+    * exactly one vocabulary word must be reachable — an ambiguous token is
+      left for the user.
+    """
+    updated = [row[:] for row in grid]
+    for row in range(ROWS):
+        col = FIRST_DATA_COL
+        while col <= LAST_DATA_COL:
+            if not updated[row][col]:
+                col += 1
+                continue
+            start = col
+            chars: list[str] = []
+            while col <= LAST_DATA_COL and updated[row][col]:
+                chars.append(updated[row][col])
+                col += 1
+            token = "".join(chars)
+            repaired = _repair_token(token)
+            if repaired != token:
+                for offset, char in enumerate(repaired):
+                    updated[row][start + offset] = char
+    return normalize_grid_guards(updated)
+
+
+def _repair_token(token: str) -> str:
+    core = token.strip("<>/.")
+    if not core or core in MCDU_VOCABULARY:
+        return token
+    if not any(char.isalpha() for char in core):
+        return token  # pure value (250, 12000) — never guess at it
+    candidates = {
+        core[:index] + replacement + core[index + 1 :]
+        for index, char in enumerate(core)
+        for replacement in OCR_CONFUSIONS.get(char, ())
+    }
+    matches = candidates & MCDU_VOCABULARY
+    if len(matches) != 1:
+        return token
+    return token.replace(core, matches.pop(), 1)
+
+
 def snap_title_row(grid: list[list[str]]) -> list[list[str]]:
     """A5 Part 2: Fuzzy-snap row 0 text to the nearest MCDU_TITLE_VOCABULARY entry.
 
@@ -3855,7 +4087,11 @@ def remember_templates(payload: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(source_grid, list) or len(source_grid) != ROWS:
         raise ValueError("The original OCR grid is required for selective template learning.")
 
-    warped = warp_screen(image, corners)
+    # Must match the image apply_templates classifies against (#14/#15/#17).
+    # Learning from the raw warp while inference runs on the cleaned warp puts
+    # the cursor, glare and entry outlines into the stored feature vectors, so
+    # exactly the cells a user corrects most are the ones that never re-match.
+    warped = clean_warped_image(warp_screen(image, corners))
     templates = load_templates()
     learned = 0
     for row_index, row in enumerate(grid):
@@ -3899,6 +4135,8 @@ def score_candidate_row(
         bool(cell) for cell in candidate_grid[row][FIRST_DATA_COL : LAST_DATA_COL + 1]
     )
     score = mcdu_row_score(text) + confidence_score * 2.0 + character_count * 0.5
+    if candidate[0] == "per_row":
+        score *= _PER_ROW_SCORE_WEIGHT
     # P2-F: penalise candidates whose source words are near a row boundary
     pos_q = row_pos[row]
     if pos_q < _ROW_POS_PENALTY_THRESHOLD:
@@ -3966,7 +4204,8 @@ def analyze(payload: dict[str, Any]) -> dict[str, Any]:
     screen_size = warped.size
 
     # C1: run all variant TSV passes in parallel
-    _variants = preprocessing_variants(warped)
+    fast_mode = bool(payload.get("fastMode", False))
+    _variants = preprocessing_variants(warped, fast=fast_mode)
     _t0 = time.perf_counter()
     with ThreadPoolExecutor(max_workers=min(len(_variants), 8)) as _pool:
         _all_words = list(_pool.map(lambda vi: run_tesseract_tsv(vi[1]), _variants))
@@ -4002,6 +4241,15 @@ def analyze(payload: dict[str, Any]) -> dict[str, Any]:
             place_word(box_grid, box_scores, box_confidence, word, geometry)
         word_candidates.append(("message_box", box_grid, box_confidence, [1.0] * ROWS))
 
+    # #18 per-row strip OCR is OFF by default. Measured across the reference
+    # office photos it is a net negative: PSM 7 assumes the strip IS a line of
+    # text, so it invents characters inside an empty entry box, and that
+    # inflated character count out-scores a better whole-image read. Turning it
+    # off raised row similarity 68.3% -> 72.1% and cut ~0.2s. The synthetic
+    # harness (clean, blur 1.2, blur 2.0 — the cases it was added for) stays at
+    # 100%. Opt back in per request with {"rowStripOcr": true}.
+    strip_requested = bool(payload.get("rowStripOcr", False))
+
     # C3: skip per-row strip if existing word candidates are already high-confidence
     _draft_conf = [[0.0] * COLS for _ in range(ROWS)]
     for _, _cg, _cc, *_ in word_candidates:
@@ -4015,7 +4263,11 @@ def analyze(payload: dict[str, Any]) -> dict[str, Any]:
         for _c in range(FIRST_DATA_COL, LAST_DATA_COL + 1)
         if _draft_conf[_r][_c] > 0
     ]
-    _skip_strip = bool(_filled_conf) and sum(_filled_conf) / len(_filled_conf) >= _STRIP_SKIP_CONFIDENCE
+    _skip_strip = (
+        not strip_requested
+        or fast_mode
+        or (bool(_filled_conf) and sum(_filled_conf) / len(_filled_conf) >= _STRIP_SKIP_CONFIDENCE)
+    )
 
     # C1: run box pass and (optionally) per-row strip concurrently
     _t1 = time.perf_counter()
@@ -4048,6 +4300,16 @@ def analyze(payload: dict[str, Any]) -> dict[str, Any]:
             paddle_scores = [[0.0 for _ in range(COLS)] for _ in range(ROWS)]
             for word in paddle_words:
                 place_word(paddle_grid, paddle_scores, paddle_confidence, word, geometry)
+
+    # Repair OCR character confusions before row selection, not after. A label
+    # row that bleeds into the row below arrives as "CR2 ALT" over "CRZ ALT" —
+    # two different strings, so deduplicate_adjacent_rows cannot see the repeat
+    # and the real value underneath (a boxed entry field) stays lost. Normalising
+    # first lets both the scorer and the dedup pass compare like with like.
+    word_candidates = [
+        (name, repair_confusable_tokens(candidate_grid), candidate_confidence, row_pos)
+        for name, candidate_grid, candidate_confidence, row_pos in word_candidates
+    ]
 
     word_grid = empty_grid()
     word_confidence = empty_confidence_grid()
@@ -4103,6 +4365,8 @@ def analyze(payload: dict[str, Any]) -> dict[str, Any]:
     for _chip_col, _chip_ch in detect_title_chip_text(warped, geometry):
         grid[0][_chip_col] = _chip_ch
     grid = snap_title_row(grid)
+    grid = repair_confusable_tokens(grid)
+    raw_grid = normalize_grid_guards(grid)  # pre-corrections; the key future corrections are stored against
     corrected_grid = apply_corrections(grid)
     verification_summary = None
     verification = payload.get("verification")
@@ -4121,6 +4385,7 @@ def analyze(payload: dict[str, Any]) -> dict[str, Any]:
 
     return {
         "grid": corrected_grid,
+        "rawGrid": raw_grid,
         "words": words,
         "boxes": boxes,
         "calibration": geometry,
@@ -4312,9 +4577,21 @@ class McmduHandler(SimpleHTTPRequestHandler):
                 json_response(self, HTTPStatus.OK, fuse_photos(payload))
             else:
                 json_response(self, HTTPStatus.NOT_FOUND, {"error": "Unknown endpoint."})
-        except Exception as exc:  # noqa: BLE001 - API boundary should return useful errors.
-            print(f"{self.path} failed: {exc}")
+        except ValueError as exc:
+            # Deliberate, user-facing validation messages ("Could not find a dark
+            # MCDU display region", "Four screen corners are required").
+            print(f"{self.path} rejected: {exc}")
             json_response(self, HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+        except Exception:  # noqa: BLE001 - API boundary must not leak a stack to the page.
+            # Unexpected failure. The full traceback goes to the console window
+            # the user is already running; without it a colleague's bug report
+            # is just a one-line message with nothing to reproduce from.
+            print(f"{self.path} FAILED:\n{traceback.format_exc()}", flush=True)
+            json_response(
+                self,
+                HTTPStatus.INTERNAL_SERVER_ERROR,
+                {"error": "Something went wrong. Check the console window for details."},
+            )
 
 
 def main() -> None:
